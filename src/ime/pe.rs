@@ -110,8 +110,10 @@ pub(super) fn verify(b: &[u8]) -> Result<()> {
             if index == 5 {
                 let at = raw(rva, 32)?;
                 let abi = b[at..at + 32]
-                    .chunks_exact(8)
-                    .map(|v| u64::from_le_bytes(v.try_into().unwrap()))
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|v| u64::from_le_bytes(*v))
                     .collect::<Vec<_>>();
                 if abi != [4, 9, 7, 1] {
                     return Err("IME DLL ABI differs from supported native profile".into());

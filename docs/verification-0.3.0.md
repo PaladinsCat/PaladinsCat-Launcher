@@ -23,6 +23,11 @@ short-path TEMP alias comparing against the plan's full path. Executable identit
 now resolve existing paths before comparison; the observation deadline is unchanged.
 The regression covers requested/full/dotted aliases and inaccessible-path refusal.
 
+The corrected path tests passed in CI. Its floating stable toolchain then exposed
+a Rust 1.99 Clippy warning absent from the local Rust 1.97 checks. Source and CI now
+pin Rust 1.97.0 for reproducibility; fixed-size array iteration was also updated to
+the newer form without changing PE parsing or CPU preview behavior.
+
 The WatchCat workspace's required `scripts/test.ps1` also passed its 39 tests and existing format/check/lint gates during migration.
 
 No game launch, game installation, desktop capture or foreground GUI interaction was performed for these checks. They do not establish live GUI GPU routing, native hook initialization, portable IME disable/restoration, combined-mod gameplay compatibility or performance improvement. Localization coverage and visual acceptance remain governed separately in the locale project.

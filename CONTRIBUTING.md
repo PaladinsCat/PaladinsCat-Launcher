@@ -2,6 +2,9 @@
 
 Use Rust and submit a pull request to protected `main`. Changes require owner review after repository bootstrap.
 
+`rust-toolchain.toml` pins Rust 1.97.0 with Clippy/rustfmt. CI uses the same version;
+upgrade the source and CI pins together through a reviewed pull request.
+
 ```text
 cargo fmt --all --check
 cargo test --locked --all-targets
