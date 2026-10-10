@@ -6,7 +6,7 @@ Source implementation checks performed on Windows x64, 2026-10-10.
 | --- | --- |
 | Standalone Rust crate, no sibling source dependencies | Passed |
 | Format and strict Clippy across all targets | Passed |
-| Offline unit tests | 67 passed; one network test ignored by default |
+| Offline unit tests | 68 passed; one network test ignored by default |
 | Explicit published performance v0.1.0 download/import test | Passed; payloads not executed |
 | Localization install/update/rollback/recovery | Temporary-file fixtures passed |
 | IME enable/disable, receipts and concurrent-operation guards | Temporary-file fixtures passed |
@@ -17,6 +17,11 @@ Source implementation checks performed on Windows x64, 2026-10-10.
 | GUI layout | Three CPU previews reviewed at 880 by 960; package/apply and toggle controls visible |
 | User-data path | Known-folder lookup resists environment overrides; inherited MSIX file virtualization remains a host-specific boundary |
 | Windows release executables | Built locally; generated artifacts excluded from Git |
+
+The initial Windows CI run found a process-identity fixture failure caused by a
+short-path TEMP alias comparing against the plan's full path. Executable identities
+now resolve existing paths before comparison; the observation deadline is unchanged.
+The regression covers requested/full/dotted aliases and inaccessible-path refusal.
 
 The WatchCat workspace's required `scripts/test.ps1` also passed its 39 tests and existing format/check/lint gates during migration.
 
