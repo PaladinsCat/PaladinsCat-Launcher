@@ -63,7 +63,7 @@ pub fn render(path: &Path, tab: super::PackageTab, prepared: bool) -> Result<(),
         let Some(texture) = textures.get(&mesh.texture_id) else {
             continue;
         };
-        for triangle in mesh.indices.chunks_exact(3) {
+        for triangle in mesh.indices.as_chunks::<3>().0 {
             let a = mesh.vertices[triangle[0] as usize];
             let b = mesh.vertices[triangle[1] as usize];
             let c = mesh.vertices[triangle[2] as usize];

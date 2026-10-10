@@ -75,7 +75,9 @@ fn argument_path(path: &Path) -> engine::Result<String> {
 }
 
 fn path_key(path: &Path) -> engine::Result<String> {
-    let value = argument_path(path)?;
+    // Process discovery and TEMP can use 8.3 aliases; plans use final paths.
+    // Resolve both before comparing, retaining failure for inaccessible paths.
+    let value = argument_path(&path.canonicalize().map_err(error)?)?;
     Ok(value
         .strip_prefix(r"\\?\UNC\")
         .map(|tail| format!(r"\\{tail}"))
@@ -1223,6 +1225,20 @@ mod tests {
         .unwrap();
         assert_eq!(r.game_pid, Some(88));
         assert!(r.status.contains("not yet verified"));
+    }
+
+    #[test]
+    fn executable_identity_resolves_existing_path_aliases() {
+        let f = Fixture::new();
+        let requested = f.options.game_root.join(GAME);
+        let final_path = requested.canonicalize().unwrap();
+        assert_eq!(
+            path_key(&requested).unwrap(),
+            path_key(&final_path).unwrap()
+        );
+        let dotted = f.options.game_root.join("Binaries/Win64/./Paladins.exe");
+        assert_eq!(path_key(&dotted).unwrap(), path_key(&final_path).unwrap());
+        assert!(path_key(&f.options.game_root.join("missing.exe")).is_err());
     }
 
     #[test]
