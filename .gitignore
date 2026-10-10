@@ -1,0 +1,9 @@
+/target/
+/dist/
+/artifacts/
+*.exe
+*.dll
+*.pdb
+*.zip
+*.log
+.env*
