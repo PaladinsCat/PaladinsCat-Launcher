@@ -20,6 +20,10 @@ use std::{
 };
 
 const GAME: &str = "Binaries/Win64/Paladins.exe";
+const ENGINE_CONFIGS: [&str; 2] = [
+    "Engine/Config/BaseEngine.ini",
+    "ChaosGame/Config/DefaultEngine.ini",
+];
 const REGISTRY: &str = ".tempest/mods/mods.json";
 const MAX_METADATA: u64 = 4 * 1024 * 1024;
 const MAX_MODS: usize = 4096;
@@ -41,10 +45,12 @@ pub struct Plan {
     pub args: Vec<String>,
     pub game_root: PathBuf,
     pub game_executable: PathBuf,
+    pub working_directory: PathBuf,
     pub tempest_cli: PathBuf,
     /// Verified managed payloads, including any loaded once through the registry.
     pub dlls: Vec<PathBuf>,
     registry: Option<(PathBuf, String)>,
+    engine_configs: Vec<(PathBuf, String)>,
 }
 
 #[derive(Clone, Debug)]
@@ -71,6 +77,25 @@ fn argument_path(path: &Path) -> engine::Result<String> {
     if value.is_empty() || value.contains(',') || value.chars().any(char::is_control) {
         return Err("Launch paths cannot contain commas or control characters".into());
     }
+    // Canonical paths are retained for identity, containment and file pins. UE3
+    // and the external loader receive ordinary Win32 paths, not verbatim syntax.
+    if let Some(tail) = value.strip_prefix(r"\\?\UNC\") {
+        let mut parts = tail.split('\\');
+        if parts.next().is_none_or(str::is_empty) || parts.next().is_none_or(str::is_empty) {
+            return Err("Launch UNC paths require a server and share".into());
+        }
+        return Ok(format!(r"\\{tail}"));
+    }
+    if let Some(tail) = value.strip_prefix(r"\\?\") {
+        let bytes = tail.as_bytes();
+        if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1..3] == *b":\\" {
+            return Ok(tail.to_owned());
+        }
+        return Err("Launch paths must use a drive or UNC share, not a device namespace".into());
+    }
+    if value.starts_with(r"\\.\") {
+        return Err("Launch paths cannot use a device namespace".into());
+    }
     Ok(value.to_owned())
 }
 
@@ -78,12 +103,17 @@ fn path_key(path: &Path) -> engine::Result<String> {
     // Process discovery and TEMP can use 8.3 aliases; plans use final paths.
     // Resolve both before comparing, retaining failure for inaccessible paths.
     let value = argument_path(&path.canonicalize().map_err(error)?)?;
-    Ok(value
-        .strip_prefix(r"\\?\UNC\")
-        .map(|tail| format!(r"\\{tail}"))
-        .unwrap_or_else(|| value.trim_start_matches(r"\\?\").to_owned())
-        .replace('/', "\\")
-        .to_lowercase())
+    Ok(value.replace('/', "\\").to_lowercase())
+}
+
+fn external_path(path: &Path) -> engine::Result<String> {
+    let value = argument_path(path)?;
+    // Removing verbatim syntax must not redirect a trailing-dot/space component
+    // to a different ordinary Win32 file. Resolve both before crossing the boundary.
+    if path.canonicalize().map_err(error)? != Path::new(&value).canonicalize().map_err(error)? {
+        return Err("Launch path changes filesystem identity in ordinary path syntax".into());
+    }
+    Ok(value)
 }
 
 fn inside(root: &Path, path: &Path) -> engine::Result<PathBuf> {
@@ -246,6 +276,23 @@ fn plan_with(
     if !executable.is_file() {
         return Err("The selected Win64 game executable is missing".into());
     }
+    let working_directory = executable
+        .parent()
+        .ok_or("Game executable has no working directory")?
+        .to_path_buf();
+    let mut engine_configs = Vec::new();
+    for relative in ENGINE_CONFIGS {
+        let path = inside(&root, &root.join(relative))
+            .map_err(|e| format!("Required startup configuration {relative}: {e}"))?;
+        let metadata = fs::metadata(&path).map_err(error)?;
+        if !metadata.is_file() || metadata.len() == 0 {
+            return Err(format!(
+                "Required startup configuration {relative} is missing or empty"
+            ));
+        }
+        let sha = upk_patcher::sha256_file(&path)?;
+        engine_configs.push((path, sha));
+    }
     let cli = options.tempest_cli.canonicalize().map_err(error)?;
     if !cli.is_file()
         || !cli
@@ -255,7 +302,7 @@ fn plan_with(
     {
         return Err("Select the installed tempest-cli.exe".into());
     }
-    argument_path(&cli)?;
+    external_path(&cli)?;
     verify_state(&root, &options.language)?;
     let dlls = select(options, &root)?;
     let mut unique = HashSet::new();
@@ -275,11 +322,11 @@ fn plan_with(
     let explicit: Vec<_> = dlls
         .iter()
         .filter(|dll| !automatic.contains(&path_key(dll).expect("DLL paths already validated")))
-        .map(|dll| argument_path(dll))
+        .map(|dll| external_path(dll))
         .collect::<engine::Result<_>>()?;
     let mut args = vec![
         "launch".into(),
-        argument_path(&root)?,
+        external_path(&root)?,
         "--platform".into(),
         "Win64".into(),
         "--homedir".into(),
@@ -301,9 +348,11 @@ fn plan_with(
         args,
         game_root: root,
         game_executable: executable,
+        working_directory,
         tempest_cli: cli,
         dlls,
         registry,
+        engine_configs,
     })
 }
 
@@ -520,6 +569,18 @@ trait Host {
     fn pause(&self);
 }
 struct WindowsHost;
+fn launch_command(plan: &Plan) -> engine::Result<Command> {
+    let mut command = Command::new(external_path(&plan.tempest_cli)?);
+    command
+        .args(&plan.args)
+        .current_dir(external_path(&plan.working_directory)?);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000200); // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+    }
+    Ok(command)
+}
 impl Host for WindowsHost {
     fn inventory(&self) -> engine::Result<Vec<GameProcess>> {
         game_processes()
@@ -531,17 +592,8 @@ impl Host for WindowsHost {
             .open(log)
             .map_err(error)?;
         let err = out.try_clone().map_err(error)?;
-        let mut command = Command::new(&plan.tempest_cli);
-        command
-            .args(&plan.args)
-            .stdin(Stdio::null())
-            .stdout(out)
-            .stderr(err);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x08000200); // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
-        }
+        let mut command = launch_command(plan)?;
+        command.stdin(Stdio::null()).stdout(out).stderr(err);
         Ok(Box::new(command.spawn().map_err(error)?))
     }
     fn pause(&self) {
@@ -569,6 +621,7 @@ fn pinned_handles(plan: &Plan) -> engine::Result<Vec<File>> {
         .chain(std::iter::once(&plan.tempest_cli))
         .chain(plan.dlls.iter())
         .chain(plan.registry.iter().map(|(path, _)| path))
+        .chain(plan.engine_configs.iter().map(|(path, _)| path))
         .map(|path| {
             let mut options = OpenOptions::new();
             options.read(true);
@@ -791,6 +844,11 @@ mod tests {
                 fs::create_dir_all(root.join(dir)).unwrap();
             }
             fs::write(root.join(GAME), b"fixture-game").unwrap();
+            for relative in ENGINE_CONFIGS {
+                let path = root.join(relative);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, b"[URL]\nfixture=true\n").unwrap();
+            }
             let cli = home.join("tempest-cli.exe");
             fs::write(&cli, b"not-an-executable").unwrap();
             Self {
@@ -912,6 +970,167 @@ mod tests {
     }
 
     #[test]
+    fn external_paths_preserve_unicode_spaces_and_unc_without_device_syntax() {
+        for (input, expected) in [
+            (r"\\?\C:\Paladins\Season 8.1", r"C:\Paladins\Season 8.1"),
+            (r"\\?\D:\번역 자료\input.dll", r"D:\번역 자료\input.dll"),
+            (
+                r"\\?\UNC\server\share\번역 자료",
+                r"\\server\share\번역 자료",
+            ),
+            (r"C:\Paladins\Season 8.1", r"C:\Paladins\Season 8.1"),
+        ] {
+            assert_eq!(argument_path(Path::new(input)).unwrap(), expected);
+        }
+        for input in [
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1",
+            r"\\.\C:",
+            r"\\?\C:relative",
+            r"\\?\UNC\server",
+            r"\\?\UNC\\share",
+        ] {
+            assert!(argument_path(Path::new(input)).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn launch_command_resolves_relative_engine_config_from_game_binaries() {
+        let f = Fixture::new();
+        let dll = f.dll("cache/input with spaces.dll");
+        let plan = f.plan(&[dll]).unwrap();
+        let command = launch_command(&plan).unwrap();
+        let cwd = command.get_current_dir().unwrap();
+        assert_eq!(cwd.canonicalize().unwrap(), plan.working_directory);
+        assert_eq!(
+            cwd.join("../../ChaosGame/Config/DefaultEngine.ini")
+                .canonicalize()
+                .unwrap(),
+            f.options
+                .game_root
+                .join(ENGINE_CONFIGS[1])
+                .canonicalize()
+                .unwrap()
+        );
+        assert_eq!(
+            Path::new(command.get_program()).canonicalize().unwrap(),
+            plan.tempest_cli
+        );
+        for value in std::iter::once(command.get_program())
+            .chain(std::iter::once(cwd.as_os_str()))
+            .chain(command.get_args())
+        {
+            assert!(!value.to_str().unwrap().contains(r"\\?\"));
+        }
+        assert_eq!(command.get_args().next().unwrap(), "launch");
+        assert_eq!(plan.engine_configs.len(), 2);
+        assert_eq!(pinned_handles(&plan).unwrap().len(), 5);
+        assert_eq!(
+            path_key(&f.options.game_root).unwrap(),
+            path_key(&plan.game_root).unwrap()
+        );
+    }
+
+    #[test]
+    fn missing_or_empty_startup_config_refuses_dispatch() {
+        let f = Fixture::new();
+        let config = f.options.game_root.join(ENGINE_CONFIGS[1]);
+        fs::write(&config, b"").unwrap();
+        assert!(f.plan(&[]).unwrap_err().contains("missing or empty"));
+        fs::rename(&config, config.with_extension("ini.saved")).unwrap();
+        let host = fake(vec![vec![]]);
+        let result = start_with(
+            &f.options,
+            &f.home.join("logs"),
+            &host,
+            || f.plan(&[]),
+            Duration::ZERO,
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .contains("Required startup configuration")
+        );
+        assert_eq!(host.dispatched.get(), 0);
+        assert!(!f.home.join("logs").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_module_relative_config_lookup_requires_ordinary_transport() {
+        use std::{ffi::c_void, os::windows::ffi::OsStrExt};
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn CreateFileW(
+                name: *const u16,
+                access: u32,
+                share: u32,
+                security: *mut c_void,
+                creation: u32,
+                flags: u32,
+                template: *mut c_void,
+            ) -> *mut c_void;
+            fn CloseHandle(handle: *mut c_void) -> i32;
+        }
+        fn native_open(path: &Path) -> std::io::Result<()> {
+            let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            // Exercise the legacy read contract directly: std::fs can normalize
+            // paths before CreateFileW and would hide this native failure.
+            let handle = unsafe {
+                CreateFileW(
+                    name.as_ptr(),
+                    0x8000_0000, // GENERIC_READ
+                    1,           // FILE_SHARE_READ
+                    std::ptr::null_mut(),
+                    3, // OPEN_EXISTING
+                    0x80,
+                    std::ptr::null_mut(),
+                )
+            };
+            if handle as isize == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            assert_ne!(unsafe { CloseHandle(handle) }, 0);
+            Ok(())
+        }
+        let f = Fixture::new();
+        let plan = f.plan(&[]).unwrap();
+        let pins = pinned_handles(&plan).unwrap();
+        let module_dir = plan.game_executable.parent().unwrap();
+        let relative = r"..\..\ChaosGame\Config\DefaultEngine.ini";
+        // FString concatenates raw text. PathBuf::join on a verbatim base can
+        // normalize parent components and would mask the client behavior.
+        let verbatim = PathBuf::from(format!(r"{}\{relative}", module_dir.display()));
+        assert!(verbatim.to_str().unwrap().starts_with(r"\\?\"));
+        let ordinary = PathBuf::from(format!(
+            r"{}\{relative}",
+            external_path(module_dir).unwrap()
+        ));
+        native_open(&ordinary).unwrap();
+        let failure = native_open(&verbatim).unwrap_err();
+        assert!(
+            matches!(failure.raw_os_error(), Some(2 | 3 | 123)),
+            "unexpected native path error: {failure}"
+        );
+        // Required-file pins coexist with the actual native shared reader.
+        assert_eq!(pins.len(), 4);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ordinary_path_conversion_cannot_redirect_a_verbatim_filename() {
+        let f = Fixture::new();
+        let root = f.options.game_root.canonicalize().unwrap();
+        let ordinary = root.join("ordinary.dll");
+        let verbatim = root.join("ordinary.dll.");
+        fs::write(&ordinary, b"ordinary").unwrap();
+        fs::write(&verbatim, b"distinct-verbatim").unwrap();
+        assert_ne!(fs::read(&ordinary).unwrap(), fs::read(&verbatim).unwrap());
+        assert!(external_path(&verbatim).is_err());
+        assert!(f.plan(&[verbatim]).is_err());
+        assert!(external_path(&ordinary).is_ok());
+    }
+
+    #[test]
     fn plan_preserves_profile_and_places_multiple_dlls_before_passthrough() {
         let mut f = Fixture::new();
         f.options.language = "FRA".into();
@@ -924,7 +1143,11 @@ mod tests {
         assert!(dll + 1 < separator);
         assert_eq!(
             p.args[dll + 1],
-            format!("{},{}", first.display(), second.display())
+            format!(
+                "{},{}",
+                argument_path(&first).unwrap(),
+                argument_path(&second).unwrap()
+            )
         );
         assert!(p.args.contains(&"community-profile_2".into()));
         assert_eq!(p.args.last().unwrap(), "-Language=FRA");
@@ -964,7 +1187,7 @@ mod tests {
         let p = f.plan(std::slice::from_ref(&dll)).unwrap();
         assert_eq!(p.dlls.as_slice(), std::slice::from_ref(&dll));
         let i = p.args.iter().position(|a| a == "--dll").unwrap();
-        assert_eq!(p.args[i + 1], dll.to_str().unwrap());
+        assert_eq!(p.args[i + 1], argument_path(&dll).unwrap());
         assert!(!f.options.game_root.join(REGISTRY).exists());
     }
 
