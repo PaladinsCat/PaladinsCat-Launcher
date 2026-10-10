@@ -1,6 +1,6 @@
 [package]
 name = "paladinscat-launcher"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 default-run = "paladinscat-launcher"
 publish = false
@@ -20,6 +20,9 @@ ureq = { version = "2", features = ["json"] }
 flate2 = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[build-dependencies]
+winresource = "=0.1.31"
 
 [[bin]]
 name = "patcher-assets"

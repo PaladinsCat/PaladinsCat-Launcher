@@ -838,6 +838,8 @@ fn main() -> eframe::Result<()> {
             std::io::Error::other("Unknown launcher arguments; use --help").into(),
         ));
     }
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/paladinscat.png"))
+        .map_err(|e| eframe::Error::AppCreation(e.into()))?;
     let (wgpu_options, selected) = graphics_device::configuration()
         .map_err(|e| eframe::Error::AppCreation(std::io::Error::other(e).into()))?;
     eframe::run_native(
@@ -846,6 +848,7 @@ fn main() -> eframe::Result<()> {
             renderer: eframe::Renderer::Wgpu,
             wgpu_options,
             viewport: egui::ViewportBuilder::default()
+                .with_icon(icon)
                 .with_inner_size([880., 960.])
                 .with_min_inner_size([720., 640.]),
             ..Default::default()
