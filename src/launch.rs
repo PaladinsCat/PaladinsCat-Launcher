@@ -1056,6 +1056,67 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn native_module_relative_config_lookup_requires_ordinary_transport() {
+        use std::{ffi::c_void, os::windows::ffi::OsStrExt};
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn CreateFileW(
+                name: *const u16,
+                access: u32,
+                share: u32,
+                security: *mut c_void,
+                creation: u32,
+                flags: u32,
+                template: *mut c_void,
+            ) -> *mut c_void;
+            fn CloseHandle(handle: *mut c_void) -> i32;
+        }
+        fn native_open(path: &Path) -> std::io::Result<()> {
+            let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            // Exercise the legacy read contract directly: std::fs can normalize
+            // paths before CreateFileW and would hide this native failure.
+            let handle = unsafe {
+                CreateFileW(
+                    name.as_ptr(),
+                    0x8000_0000, // GENERIC_READ
+                    1,           // FILE_SHARE_READ
+                    std::ptr::null_mut(),
+                    3, // OPEN_EXISTING
+                    0x80,
+                    std::ptr::null_mut(),
+                )
+            };
+            if handle as isize == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            assert_ne!(unsafe { CloseHandle(handle) }, 0);
+            Ok(())
+        }
+        let f = Fixture::new();
+        let plan = f.plan(&[]).unwrap();
+        let pins = pinned_handles(&plan).unwrap();
+        let module_dir = plan.game_executable.parent().unwrap();
+        let relative = r"..\..\ChaosGame\Config\DefaultEngine.ini";
+        // FString concatenates raw text. PathBuf::join on a verbatim base can
+        // normalize parent components and would mask the client behavior.
+        let verbatim = PathBuf::from(format!(r"{}\{relative}", module_dir.display()));
+        assert!(verbatim.to_str().unwrap().starts_with(r"\\?\"));
+        let ordinary = PathBuf::from(format!(
+            r"{}\{relative}",
+            external_path(module_dir).unwrap()
+        ));
+        native_open(&ordinary).unwrap();
+        let failure = native_open(&verbatim).unwrap_err();
+        assert!(
+            matches!(failure.raw_os_error(), Some(2 | 3 | 123)),
+            "unexpected native path error: {failure}"
+        );
+        // Required-file pins coexist with the actual native shared reader.
+        assert_eq!(pins.len(), 4);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn ordinary_path_conversion_cannot_redirect_a_verbatim_filename() {
         let f = Fixture::new();
         let root = f.options.game_root.canonicalize().unwrap();

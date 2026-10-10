@@ -8,7 +8,7 @@ The 0.3.0 planner forwarded Windows canonical `\\?\` paths to the external loade
 
 Neither 0.3.0 nor the pinned Tempest Windows launch code set a working directory. Tempest's [LauncherUtility](https://github.com/LowRezStudio/Tempest/blob/efe828dd28a48c4e1861ebf25a99cc16bd4b2425/Tempest.CLI/Launcher/LauncherUtility.cs#L7) resolves the root and constructs the executable path. [LauncherCommands](https://github.com/LowRezStudio/Tempest/blob/efe828dd28a48c4e1861ebf25a99cc16bd4b2425/Tempest.CLI/Launcher/LauncherCommands.cs#L89) starts it without a working-directory override. [WineExtensions](https://github.com/LowRezStudio/Tempest/blob/efe828dd28a48c4e1861ebf25a99cc16bd4b2425/Tempest.CLI/Extensions/WineExtensions.cs#L24) leaves the Windows process unchanged.
 
-These two launch-contract defects are confirmed. Their contribution to the exact legacy engine failure is inferred from the dialog and launch evidence; the failing native instruction was not traced.
+Offline client analysis matched the supplied stack to the early default-INI read failure. That reader obtains the loaded module's directory and concatenates `..\..\ChaosGame\Config\DefaultEngine.ini` without normalizing it. [GetModuleFileNameW preserves the loaded filename format](https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getmodulefilenamew), while [the extended namespace disables normal path expansion](https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file#win32-file-namespaces). Therefore the verbatim executable path propagates into an unresolved parent-directory lookup. An offline Windows fixture reproduces its failure using raw `CreateFileW`; the ordinary transport path opens the same existing file while the configuration pins remain held. The working-directory correction is defensive; this exact early reader uses the module directory as its base.
 
 ## Repair
 
@@ -25,9 +25,10 @@ Windows x64 checks performed on 2026-10-10:
 
 | Check | Result |
 | --- | --- |
-| Offline launcher tests | 72 passed; one unrelated network test ignored by default |
+| Offline launcher tests | 73 passed; one unrelated network test ignored by default |
 | Strict Clippy, formatting and release build | Passed with pinned Rust 1.97.0 |
 | Relative default-INI lookup from prepared child working directory | Passed without spawning a process |
+| Raw native module-relative default-INI lookup with configuration pins held | Verbatim path fails; ordinary transport opens the existing file |
 | Drive/UNC transport, Unicode/spaces and device refusal | Passed |
 | Real Windows trailing-dot conversion selecting another file | Refused |
 | Missing/empty required startup INI | Refused before dispatch/log creation |
