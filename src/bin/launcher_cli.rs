@@ -56,6 +56,7 @@ fn run() -> engine::Result<()> {
                 serde_json::to_string_pretty(&serde_json::json!({
                     "tempest_cli": plan.tempest_cli,
                     "game_root": plan.game_root,
+                    "working_directory": plan.working_directory,
                     "args": plan.args,
                     "verified_dlls": plan.dlls,
                     "game_launched": false,
