@@ -20,6 +20,13 @@ No background service is required. The in-process DLL retains its hooks after th
 
 ## Package and update contracts
 
+Performance is the first top-level menu option and opens by default. Localization
+contains its package-language selector. Selecting `KOR` exposes Translation and
+Korean IME patch subpages; other locales show only translation controls. The
+language selector remains visible on the IME subpage. Changing away from Korean
+returns that subpage to Translation without changing the installed IME receipt
+or any next-launch selection.
+
 `src/sources.rs` owns repository identities and public source URLs shared by
 the GUI, package downloader and release assembler. Repository links, settings
 and publication status appear below the selected feature tab, after the common

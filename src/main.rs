@@ -128,6 +128,7 @@ impl Settings {
 #[derive(Clone, Copy, PartialEq)]
 enum PackageTab {
     Translation,
+    // Korean-only child of Localization, never a top-level menu option.
     Ime,
     Performance,
 }
@@ -313,7 +314,7 @@ impl App {
             error: false,
             logo,
             preview,
-            tab: PackageTab::Translation,
+            tab: PackageTab::Performance,
             catalog_status: "Catalog not checked".into(),
             catalog_connected: false,
             performance_selected: None,
@@ -650,9 +651,18 @@ impl App {
                 }
             });
     }
+    fn korean_ime_available(&self) -> bool {
+        self.language.eq_ignore_ascii_case("KOR")
+    }
+    fn reconcile_navigation(&mut self) {
+        if self.tab == PackageTab::Ime && !self.korean_ime_available() {
+            self.tab = PackageTab::Translation;
+        }
+    }
     fn render(&mut self, root_ui: &mut egui::Ui) {
         let ctx = &root_ui.ctx().clone();
         self.receive();
+        self.reconcile_navigation();
         let busy = self.receiver.is_some();
         egui::Panel::top("brand")
             .frame(
@@ -726,16 +736,12 @@ impl App {
                 });
                 ui.add_space(12.);
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.tab, PackageTab::Translation, "Localization");
-                    ui.selectable_value(&mut self.tab, PackageTab::Ime, "Korean IME patch");
                     ui.selectable_value(&mut self.tab, PackageTab::Performance, "Performance");
+                    if ui.selectable_label(self.tab != PackageTab::Performance, "Localization").clicked() && self.tab == PackageTab::Performance {
+                        self.tab = PackageTab::Translation;
+                    }
                 });
-                ui.add_space(6.);
-                self.repository_panel(ui, ctx, busy);
-                ui.add_space(12.);
-                if self.tab == PackageTab::Translation {
-                card().show(ui, |ui| {
-                    ui.set_min_width(ui.available_width()); ui.label(RichText::new("Translation package").font(bold_font(16.)));
+                if self.tab != PackageTab::Performance {
                     ui.add_enabled_ui(!busy, |ui| {
                         ui.horizontal(|ui| {
                             ui.label("Language");
@@ -746,6 +752,25 @@ impl App {
                                     self.release_index = self.releases.iter().position(|r| r.locale == self.language).unwrap_or(0);
                                 }}
                             });
+                        });
+                    });
+                    self.reconcile_navigation();
+                    if self.korean_ime_available() {
+                        ui.horizontal(|ui| {
+                            ui.add_space(12.);
+                            ui.selectable_value(&mut self.tab, PackageTab::Translation, "Translation");
+                            ui.selectable_value(&mut self.tab, PackageTab::Ime, "Korean IME patch");
+                        });
+                    }
+                }
+                ui.add_space(6.);
+                self.repository_panel(ui, ctx, busy);
+                ui.add_space(12.);
+                if self.tab == PackageTab::Translation {
+                card().show(ui, |ui| {
+                    ui.set_min_width(ui.available_width()); ui.label(RichText::new("Translation package").font(bold_font(16.)));
+                    ui.add_enabled_ui(!busy, |ui| {
+                        ui.horizontal(|ui| {
                             if ui.button("Import package…").clicked() && let Some(path) = rfd::FileDialog::new().add_filter("Package manifest", &["json"]).pick_file() {
                                 let cache = engine::data_dir(); self.work(ctx, move |p| engine::import(&path, &cache, p).map(|package| Work::Package(Box::new(package))));
                             }
@@ -789,7 +814,7 @@ impl App {
                 });
                 }
                 ui.add_space(12.);
-                if self.tab == PackageTab::Ime {
+                if self.tab == PackageTab::Ime && self.korean_ime_available() {
                 card().show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     ui.label(RichText::new("Korean IME compatibility").font(bold_font(16.)));
@@ -1189,8 +1214,7 @@ mod tests {
         assert_eq!(app.ime_releases.len(), 1);
     }
 
-    #[test]
-    fn repository_is_rendered_below_tabs_and_only_for_the_selected_feature() {
+    fn rendered_text(app: &mut App, ctx: &egui::Context) -> String {
         fn text(shape: &egui::epaint::Shape, result: &mut String) {
             match shape {
                 egui::epaint::Shape::Text(value) => {
@@ -1205,6 +1229,65 @@ mod tests {
                 _ => {}
             }
         }
+        let mut result = String::new();
+        for _ in 0..3 {
+            result.clear();
+            let mut frame = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(880., 960.),
+                    )),
+                    ..Default::default()
+                },
+                |ui| app.render(ui),
+            );
+            for shape in frame.shapes {
+                text(&shape.shape, &mut result);
+            }
+            // This CPU assertion inspects text only, without a texture renderer.
+            frame.textures_delta.clear();
+        }
+        result
+    }
+
+    #[test]
+    fn korean_ime_is_a_conditional_localization_child_and_preserves_configuration() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, true);
+        assert!(app.tab == PackageTab::Performance);
+        let result = rendered_text(&mut app, &ctx);
+        assert!(result.find("Performance").unwrap() < result.find("Localization").unwrap());
+        assert!(!result.contains("Korean IME patch"));
+
+        app.accept_catalog(catalog_fixture(true, true));
+        app.tab = PackageTab::Translation;
+        let result = rendered_text(&mut app, &ctx);
+        assert!(result.find("Localization").unwrap() < result.find("Language").unwrap());
+        assert!(result.find("Language").unwrap() < result.find("Korean IME patch").unwrap());
+        assert!(!result.contains("Korean IME compatibility"));
+
+        app.tab = PackageTab::Ime;
+        app.ime_installed = ImeInstallState::Enabled(Box::new(ime_package("0.1.0").package));
+        app.accept_ime(ime_package("0.1.0"));
+        let saved = serde_json::to_value(&app.settings).unwrap();
+        let result = rendered_text(&mut app, &ctx);
+        assert!(result.contains("Language\n"));
+        assert!(result.contains("Korean IME compatibility"));
+
+        app.language = "ENG".into();
+        let result = rendered_text(&mut app, &ctx);
+        assert!(app.tab == PackageTab::Translation);
+        assert!(!result.contains("Korean IME patch"));
+        assert!(!result.contains("Korean IME compatibility"));
+        assert!(!result.contains("Enable Korean IME fix"));
+        assert!(app.ime_installed.enabled());
+        assert!(app.ime_selected.is_some());
+        assert_eq!(serde_json::to_value(&app.settings).unwrap(), saved);
+    }
+
+    #[test]
+    fn repository_is_rendered_below_tabs_and_only_for_the_selected_feature() {
         for tab in [
             PackageTab::Translation,
             PackageTab::Ime,
@@ -1214,25 +1297,7 @@ mod tests {
             let mut app = App::new(&ctx, true);
             app.tab = tab;
             app.accept_catalog(catalog_fixture(true, true));
-            let mut result = String::new();
-            for _ in 0..3 {
-                result.clear();
-                let mut frame = ctx.run_ui(
-                    egui::RawInput {
-                        screen_rect: Some(egui::Rect::from_min_size(
-                            egui::Pos2::ZERO,
-                            egui::vec2(880., 960.),
-                        )),
-                        ..Default::default()
-                    },
-                    |ui| app.render(ui),
-                );
-                for shape in frame.shapes {
-                    text(&shape.shape, &mut result);
-                }
-                // This CPU assertion inspects text only, without a texture renderer.
-                frame.textures_delta.clear();
-            }
+            let result = rendered_text(&mut app, &ctx);
             let repository = if tab == PackageTab::Performance {
                 performance::REPOSITORY
             } else {
