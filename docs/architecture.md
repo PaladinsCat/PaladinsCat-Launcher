@@ -8,6 +8,10 @@ Windows resolves the LocalAppData known folder with package redirection disabled
 
 **Play** validates the selected game, installed IME receipt, enabled performance package and native system fingerprints, then invokes the installed Tempest CLI without opening a console. The selected profile and three-letter game locale are passed as separate arguments. Custom DLLs appear before Tempest's `--` native-argument separator. Only one performance input variant is selected. The launcher does not close an existing client.
 
+New settings and CLI operations default to language `INT` and profile `PaladinsCat`. The GUI retains explicit saved language/profile choices; changing a default never migrates existing profile files. A profile is Tempest's game `--homedir`, not a localization package selector.
+
+Replay libraries are profile-specific. See [replay profiles](replay-profiles.md) for storage, playback and cross-profile handling.
+
 Canonical paths remain the internal identities for containment, receipts, deduplication and read-only file pins. External executable, game-root and DLL paths use ordinary Win32 drive/UNC syntax. Conversion must resolve back to the same file; unsupported device namespaces and conversions that redirect a trailing-dot/space component are refused. The Tempest child receives the game's `Binaries/Win64` as its working directory, which its Windows game child inherits. The two required startup INIs are checked under the selected root, hashed, pinned and compared again before dispatch. No game configuration is rewritten. See [0.3.1 verification](verification-0.3.1.md) for the startup-failure evidence and runtime boundary.
 
 Tempest's automatic mod loading uses enabled V2 records in `.tempest/mods/mods.json`; directory presence alone does not enable a mod. Our own verified IME files without a registry entry are passed explicitly. A matching registered copy is omitted from explicit DLL arguments. Conflicting managed entries are refused. Unrelated Tempest mods remain under Tempest's control.
@@ -15,6 +19,20 @@ Tempest's automatic mod loading uses enabled V2 records in `.tempest/mods/mods.j
 No background service is required. The in-process DLL retains its hooks after the GUI closes. Configuration and process discovery are distinct from verified hook activation; launch dispatch does not prove that the hooks initialized or that gameplay works. Turning off performance changes the next launch; the running client is not modified. IME enable/disable retains its existing guarded file transaction and recovery journal.
 
 ## Package and update contracts
+
+`src/sources.rs` owns repository identities and public source URLs shared by
+the GUI, package downloader and release assembler. Repository links, settings
+and publication status appear below the selected feature tab, after the common
+game and launch controls. Localization and Korean IME currently share the locale
+catalog, but each displays only its own release array. Performance uses the
+pinned mods release and never inherits a locale-catalog connection status.
+
+Legacy repository/catalog settings and prepared package paths are retained.
+Changing the catalog source invalidates its published lists while retaining
+verified prepared packages. Downloading does not remove published entries.
+Refreshing the catalog and switching tabs cannot turn a locale response into
+performance availability. Pinned performance source information is distinct
+from a verified downloaded package or runtime hook.
 
 Localization and IME use the existing versioned catalog schema, decoded hashes, game fingerprint and receipt/journal rollback. The performance v0.1.0 manifest, archive and source revision are pinned from the actual published assets. Archive extraction uses an exact filename allowlist, member hashes, sizes and checksums; executable contents are never invoked during validation. Source tests and cached packages do not prove performance gains or combined IME compatibility.
 

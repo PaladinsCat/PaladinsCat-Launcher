@@ -30,6 +30,9 @@ const MAX_MODS: usize = 4096;
 const MAX_DISCOVERED_DLLS: usize = 512;
 const OBSERVATION: Duration = Duration::from_secs(8);
 
+pub const DEFAULT_LANGUAGE: &str = "INT";
+pub const DEFAULT_PROFILE: &str = "PaladinsCat";
+
 #[derive(Clone, Debug)]
 pub struct Options {
     pub game_root: PathBuf,

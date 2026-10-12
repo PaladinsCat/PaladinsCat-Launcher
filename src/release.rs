@@ -175,7 +175,7 @@ fn main() -> Result<(), String> {
             serde_json::from_slice(&std::fs::read(&settings_path).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?
         } else {
-            serde_json::json!({"game_folder":"", "repository":"PaladinsCat/PaladinsCat-locales", "catalog_url":"https://raw.githubusercontent.com/PaladinsCat/PaladinsCat-locales/main/game-client/catalog.json"})
+            serde_json::json!({"game_folder":"", "repository":paladinscat_launcher::sources::LOCALE_REPOSITORY, "catalog_url":paladinscat_launcher::sources::catalog_url(paladinscat_launcher::sources::LOCALE_REPOSITORY)})
         };
         if !settings.is_object() {
             return Err("GUI settings must be an object".into());

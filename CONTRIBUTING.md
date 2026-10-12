@@ -1,9 +1,13 @@
 # Contributing
 
-Use Rust and submit a pull request to protected `main`. Changes require owner review after repository bootstrap.
+Use Rust. The owner's agent workflow stays in the existing `main` checkout and
+does not create branches, worktrees, forks or pull requests. Review the source
+and run the checks below before an authorized publication. Remote protections
+remain binding. External community contributions use owner-reviewed pull requests;
+that procedure does not authorize an agent working for the owner to create one.
 
 `rust-toolchain.toml` pins Rust 1.97.0 with Clippy/rustfmt. CI uses the same version;
-upgrade the source and CI pins together through a reviewed pull request.
+upgrade the source and CI pins together under the applicable owner review workflow.
 
 ```text
 cargo fmt --all --check

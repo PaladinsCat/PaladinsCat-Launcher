@@ -15,10 +15,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub const REPOSITORY: &str = "PaladinsCat/PaladinsCat-mods";
-pub const VERSION: &str = "0.1.0";
-pub const RELEASE_URL: &str = "https://github.com/PaladinsCat/PaladinsCat-mods/releases/tag/v0.1.0";
-const BASE: &str = "https://github.com/PaladinsCat/PaladinsCat-mods/releases/download/v0.1.0";
+pub use crate::sources::{
+    PERFORMANCE_RELEASE_URL as RELEASE_URL, PERFORMANCE_REPOSITORY as REPOSITORY,
+    PERFORMANCE_VERSION as VERSION,
+};
 const MANIFEST: &str = "manifest.json";
 const ARCHIVE: &str = "PaladinsCat-performance-v0.1.0-windows-x64.zip";
 const SUMS: &str = "SHA256SUMS.txt";
@@ -500,7 +500,13 @@ pub fn download(cache: &Path, progress: Progress<'_>) -> Result<Cached> {
         if path.exists() {
             plain(&path, false)?;
         }
-        engine::fetch(&format!("{BASE}/{name}"), &path, sha, Some(bytes), progress)?;
+        engine::fetch(
+            &crate::sources::performance_asset_url(name),
+            &path,
+            sha,
+            Some(bytes),
+            progress,
+        )?;
         pinned(&path, sha, Some(bytes))?;
     }
     let manifest = read(&downloads.join(MANIFEST), JSON_LIMIT)?;

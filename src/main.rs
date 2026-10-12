@@ -2,7 +2,8 @@
 
 mod graphics_device;
 mod preview;
-use paladinscat_launcher::{engine, ime, launch, performance};
+use paladinscat_launcher::{engine, ime, launch, performance, sources};
+use sources::{LOCALE_REPOSITORY as REPOSITORY, catalog_url};
 
 use egui::{Color32, FontFamily, FontId, RichText};
 use engine::{Action, Cached, Release};
@@ -45,17 +46,10 @@ fn default_cli() -> String {
     launch::default_tempest_cli().display().to_string()
 }
 fn default_language() -> String {
-    "KOR".into()
+    launch::DEFAULT_LANGUAGE.into()
 }
 fn default_homedir() -> String {
-    "paladinslive".into()
-}
-const REPOSITORY: &str = "PaladinsCat/PaladinsCat-locales";
-fn catalog_url(repository: &str) -> String {
-    format!(
-        "https://raw.githubusercontent.com/{}/main/game-client/catalog.json",
-        repository.trim()
-    )
+    launch::DEFAULT_PROFILE.into()
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -205,6 +199,7 @@ struct App {
     preview: bool,
     tab: PackageTab,
     catalog_status: String,
+    catalog_connected: bool,
     performance_selected: Option<performance::Cached>,
 }
 
@@ -320,6 +315,7 @@ impl App {
             preview,
             tab: PackageTab::Translation,
             catalog_status: "Catalog not checked".into(),
+            catalog_connected: false,
             performance_selected: None,
         };
         if !preview {
@@ -395,6 +391,7 @@ impl App {
                                 Ok(catalog) => self.accept_catalog(catalog),
                                 Err(error) => {
                                     self.catalog_status = "Catalog unavailable".into();
+                                    self.catalog_connected = false;
                                     failures.push(format!("GitHub catalog: {error}"));
                                 }
                             }
@@ -429,7 +426,7 @@ impl App {
                         }
                         Ok(Work::Catalog(catalog)) => {
                             self.accept_catalog(catalog);
-                            self.status = self.catalog_status.clone();
+                            self.status = "Catalog refreshed".into();
                         }
                         Ok(Work::Package(package)) => {
                             self.accept_translation(*package);
@@ -448,6 +445,7 @@ impl App {
                         Err(error) => {
                             if self.catalog_status == "Connecting to GitHub…" {
                                 self.catalog_status = "Catalog unavailable".into();
+                                self.catalog_connected = false;
                             }
                             self.error = true;
                             self.status = error;
@@ -461,6 +459,7 @@ impl App {
         }
     }
     fn accept_catalog(&mut self, catalog: engine::Catalog) {
+        self.catalog_connected = true;
         self.releases = catalog.packages;
         self.ime_releases = catalog.ime_packages;
         self.release_index = 0;
@@ -498,6 +497,7 @@ impl App {
         let settings = self.settings.clone();
         let cache = engine::data_dir();
         self.catalog_status = "Connecting to GitHub…".into();
+        self.catalog_connected = false;
         self.work(ctx, move |progress| {
             Ok(Work::Startup(Startup::load(&settings, &cache, progress)))
         });
@@ -555,8 +555,100 @@ impl App {
     fn check_updates(&mut self, ctx: &egui::Context) {
         let url = self.source_url();
         self.catalog_status = "Connecting to GitHub…".into();
+        self.catalog_connected = false;
         self.persist();
         self.work(ctx, move |_| engine::check_catalog(&url).map(Work::Catalog));
+    }
+    fn invalidate_catalog(&mut self) {
+        self.catalog_connected = false;
+        self.catalog_status = "Catalog not checked".into();
+        self.releases.clear();
+        self.ime_releases.clear();
+        self.release_index = 0;
+        self.ime_index = 0;
+    }
+    fn tab_source(&self, tab: PackageTab) -> (String, String, String) {
+        if tab == PackageTab::Performance {
+            return (
+                performance::REPOSITORY.into(),
+                performance::RELEASE_URL.into(),
+                format!("Pinned release · v{}", performance::VERSION),
+            );
+        }
+        let status = if self.catalog_connected {
+            let (count, kind) = match tab {
+                PackageTab::Translation => (self.releases.len(), "localization"),
+                PackageTab::Ime => (self.ime_releases.len(), "IME"),
+                PackageTab::Performance => unreachable!(),
+            };
+            if count == 0 {
+                format!("Connected · no {kind} packages published")
+            } else {
+                format!(
+                    "Connected · {count} {kind} package{}",
+                    if count == 1 { "" } else { "s" }
+                )
+            }
+        } else {
+            self.catalog_status.clone()
+        };
+        (self.settings.repository.clone(), self.source_url(), status)
+    }
+    fn repository_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, busy: bool) {
+        let (repository, source, status) = self.tab_source(self.tab);
+        ui.horizontal_wrapped(|ui| {
+            ui.hyperlink_to(&repository, sources::repository_url(&repository));
+            ui.label(RichText::new(status).size(12.).color(MUTED));
+            if self.tab == PackageTab::Performance {
+                ui.hyperlink_to("Release", &source);
+            } else if ui
+                .add_enabled(!busy, egui::Button::new("Refresh"))
+                .clicked()
+            {
+                self.check_updates(ctx);
+            }
+        });
+        egui::CollapsingHeader::new("Repository settings")
+            .id_salt(match self.tab {
+                PackageTab::Translation => "localization-source",
+                PackageTab::Ime => "ime-source",
+                PackageTab::Performance => "performance-source",
+            })
+            .show(ui, |ui| {
+                if self.tab == PackageTab::Performance {
+                    ui.hyperlink_to("Manifest", sources::performance_asset_url("manifest.json"));
+                } else {
+                    ui.add_enabled_ui(!busy, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("GitHub repository");
+                            let response = ui.add(
+                                egui::TextEdit::singleline(&mut self.settings.repository)
+                                    .hint_text(REPOSITORY),
+                            );
+                            if response.changed() {
+                                self.settings.catalog_url = catalog_url(&self.settings.repository);
+                                self.invalidate_catalog();
+                                self.persist();
+                            }
+                            if response.lost_focus() {
+                                self.check_updates(ctx);
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Catalog URL");
+                            let response = ui.text_edit_singleline(&mut self.settings.catalog_url);
+                            if response.changed() {
+                                self.invalidate_catalog();
+                                self.persist();
+                            }
+                            if response.lost_focus() {
+                                self.check_updates(ctx);
+                            }
+                        });
+                        ui.hyperlink_to("Catalog", source);
+                    });
+                }
+            });
     }
     fn render(&mut self, root_ui: &mut egui::Ui) {
         let ctx = &root_ui.ctx().clone();
@@ -594,29 +686,6 @@ impl App {
             });
         egui::CentralPanel::default().show(root_ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.hyperlink_to(&self.settings.repository, format!("https://github.com/{}", self.settings.repository.trim()));
-                    ui.label(RichText::new(&self.catalog_status).size(12.).color(MUTED));
-                    if ui.add_enabled(!busy, egui::Button::new("Refresh")).clicked() { self.check_updates(ctx); }
-                });
-                egui::CollapsingHeader::new("Repository settings").show(ui, |ui| {
-                    ui.add_enabled_ui(!busy, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("GitHub repository");
-                            let response = ui.add(egui::TextEdit::singleline(&mut self.settings.repository).hint_text(REPOSITORY));
-                            if response.changed() { self.settings.catalog_url = catalog_url(&self.settings.repository); self.persist(); }
-                            if response.lost_focus() { self.check_updates(ctx); }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Catalog URL");
-                            let response = ui.text_edit_singleline(&mut self.settings.catalog_url);
-                            if response.changed() { self.persist(); }
-                            if response.lost_focus() { self.check_updates(ctx); }
-                        });
-                        ui.hyperlink_to("Catalog", self.source_url());
-                    });
-                });
-                ui.add_space(12.);
                 card().show(ui, |ui| {
                     ui.set_min_width(ui.available_width()); ui.label(RichText::new("Game installation").font(bold_font(16.)));
                     ui.add_enabled_ui(!busy, |ui| { ui.horizontal(|ui| {
@@ -662,6 +731,8 @@ impl App {
                     ui.selectable_value(&mut self.tab, PackageTab::Performance, "Performance");
                 });
                 ui.add_space(6.);
+                self.repository_panel(ui, ctx, busy);
+                ui.add_space(12.);
                 if self.tab == PackageTab::Translation {
                 card().show(ui, |ui| {
                     ui.set_min_width(ui.available_width()); ui.label(RichText::new("Translation package").font(bold_font(16.)));
@@ -757,7 +828,6 @@ impl App {
                     card().show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
                         ui.label(RichText::new("Performance mod").font(bold_font(16.)));
-                        ui.hyperlink_to(performance::REPOSITORY, format!("https://github.com/{}", performance::REPOSITORY));
                         ui.add_enabled_ui(!busy, |ui| {
                             ui.horizontal_wrapped(|ui| {
                                 if ui.button("Download performance package").clicked() {
@@ -801,6 +871,12 @@ fn main() -> eframe::Result<()> {
             "catalog": startup.catalog.as_ref().map(|c|serde_json::json!({"translations":c.packages.len(),"ime_packages":c.ime_packages.len()})),
             "translation": startup.translation.as_ref().map(|p|p.as_ref().map(|p|p.package.bundle_id.clone())),
             "ime": startup.ime.as_ref().map(|p|p.as_ref().map(|p|serde_json::json!({"version":p.package.version,"draft":p.package.draft,"dll_sha256":p.package.dll_sha256}))),
+            "performance": startup.performance.as_ref().map(|p|p.as_ref().map(|p|p.package.version.clone())),
+            "feature_sources": {
+                "localization": {"repository": settings.repository, "url": settings.source_url(), "packages": startup.catalog.as_ref().map(|c|c.packages.len())},
+                "ime": {"repository": settings.repository, "url": settings.source_url(), "packages": startup.catalog.as_ref().map(|c|c.ime_packages.len())},
+                "performance": {"repository": performance::REPOSITORY, "url": performance::RELEASE_URL, "version": performance::VERSION}
+            },
             "cpu_only": true,
             "game_files_changed": false,
         });
@@ -871,9 +947,20 @@ mod tests {
         assert_eq!(settings.prepared_ime, "ime-package.json");
         assert!(!settings.performance_enabled);
         assert!(!settings.rollback_input);
-        assert_eq!(settings.launch_language, "KOR");
-        assert_eq!(settings.homedir, "paladinslive");
+        assert_eq!(settings.launch_language, "INT");
+        assert_eq!(settings.homedir, "PaladinsCat");
         assert_eq!(settings.source_url(), catalog_url(REPOSITORY));
+
+        // A profile change selects a different game home, including its replays.
+        // New defaults must not redirect an explicitly saved existing profile.
+        let mut saved = serde_json::to_value(&settings).unwrap();
+        saved["launch_language"] = serde_json::json!("KOR");
+        saved["homedir"] = serde_json::json!("existing-profile");
+        let restored: Settings = serde_json::from_value(saved).unwrap();
+        assert_eq!(restored.launch_language, "KOR");
+        assert_eq!(restored.homedir, "existing-profile");
+        assert_eq!(restored.prepared_translation, "bundle.json");
+        assert_eq!(restored.prepared_ime, "ime-package.json");
     }
 
     #[test]
@@ -999,10 +1086,167 @@ mod tests {
             "Connected · no downloadable packages published"
         );
         assert!(!app.error);
+        assert_eq!(
+            app.tab_source(PackageTab::Translation).2,
+            "Connected · no localization packages published"
+        );
+        assert_eq!(
+            app.tab_source(PackageTab::Ime).2,
+            "Connected · no IME packages published"
+        );
         app.catalog_status = "Connecting to GitHub…".into();
         deliver(&mut app, Err("offline".into()));
         assert_eq!(app.catalog_status, "Catalog unavailable");
         assert_eq!(app.status, "offline");
         assert!(app.error);
+        assert_eq!(
+            app.tab_source(PackageTab::Translation).2,
+            "Catalog unavailable"
+        );
+        assert_eq!(
+            app.tab_source(PackageTab::Performance).2,
+            "Pinned release · v0.1.0"
+        );
+    }
+
+    fn catalog_fixture(translation: bool, ime: bool) -> engine::Catalog {
+        let mut value = serde_json::json!({"schema_version":1,"packages":[],"ime_packages":[]});
+        if translation {
+            value["packages"] = serde_json::json!([{"bundle_id":"kor-fixture","locale":"KOR","game_build":"8.1","manifest_url":"https://github.com/PaladinsCat/PaladinsCat-locales/releases/download/fixture/locale-package.json","manifest_sha256":"a".repeat(64)}]);
+        }
+        if ime {
+            value["ime_packages"] = serde_json::json!([{"package_id":"ime-fixture","version":"0.1.0","game_build":"8.1","manifest_url":"https://github.com/PaladinsCat/PaladinsCat-locales/releases/download/fixture/ime-package.json","manifest_sha256":"b".repeat(64)}]);
+        }
+        engine::parse_catalog(&serde_json::to_vec(&value).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn feature_counts_are_independent_and_downloads_do_not_hide_releases() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, true);
+        app.accept_catalog(catalog_fixture(true, false));
+        assert_eq!(
+            app.tab_source(PackageTab::Translation).2,
+            "Connected · 1 localization package"
+        );
+        assert_eq!(
+            app.tab_source(PackageTab::Ime).2,
+            "Connected · no IME packages published"
+        );
+        app.accept_catalog(catalog_fixture(false, true));
+        assert_eq!(
+            app.tab_source(PackageTab::Translation).2,
+            "Connected · no localization packages published"
+        );
+        assert_eq!(
+            app.tab_source(PackageTab::Ime).2,
+            "Connected · 1 IME package"
+        );
+        app.accept_ime(ime_package("0.1.0"));
+        assert_eq!(app.ime_releases.len(), 1);
+        assert_eq!(
+            app.tab_source(PackageTab::Ime).2,
+            "Connected · 1 IME package"
+        );
+    }
+
+    #[test]
+    fn changing_catalog_source_invalidates_only_its_published_lists() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, true);
+        app.accept_catalog(catalog_fixture(true, true));
+        app.accept_ime(ime_package("0.1.0"));
+        app.settings.repository = "example/custom-locales".into();
+        app.settings.catalog_url = catalog_url(&app.settings.repository);
+        app.invalidate_catalog();
+        assert!(app.releases.is_empty() && app.ime_releases.is_empty());
+        assert!(app.ime_selected.is_some());
+        let (repository, url, status) = app.tab_source(PackageTab::Ime);
+        assert_eq!(repository, "example/custom-locales");
+        assert!(url.contains("example/custom-locales/main/"));
+        assert_eq!(status, "Catalog not checked");
+        assert_eq!(
+            app.tab_source(PackageTab::Performance).0,
+            performance::REPOSITORY
+        );
+    }
+
+    #[test]
+    fn catalog_completion_after_tab_switch_keeps_the_performance_source() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, true);
+        let (sender, receiver) = mpsc::channel();
+        app.receiver = Some(receiver);
+        app.tab = PackageTab::Performance;
+        sender
+            .send(Event::Done(Ok(Work::Catalog(catalog_fixture(true, true)))))
+            .unwrap();
+        app.receive();
+        assert_eq!(app.tab_source(app.tab).0, performance::REPOSITORY);
+        assert_eq!(app.tab_source(app.tab).2, "Pinned release · v0.1.0");
+        assert_eq!(app.status, "Catalog refreshed");
+        assert_eq!(app.releases.len(), 1);
+        assert_eq!(app.ime_releases.len(), 1);
+    }
+
+    #[test]
+    fn repository_is_rendered_below_tabs_and_only_for_the_selected_feature() {
+        fn text(shape: &egui::epaint::Shape, result: &mut String) {
+            match shape {
+                egui::epaint::Shape::Text(value) => {
+                    result.push_str(value.galley.text());
+                    result.push('\n');
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        text(shape, result);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for tab in [
+            PackageTab::Translation,
+            PackageTab::Ime,
+            PackageTab::Performance,
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = App::new(&ctx, true);
+            app.tab = tab;
+            app.accept_catalog(catalog_fixture(true, true));
+            let mut result = String::new();
+            for _ in 0..3 {
+                result.clear();
+                let mut frame = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(880., 960.),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| app.render(ui),
+                );
+                for shape in frame.shapes {
+                    text(&shape.shape, &mut result);
+                }
+                // This CPU assertion inspects text only, without a texture renderer.
+                frame.textures_delta.clear();
+            }
+            let repository = if tab == PackageTab::Performance {
+                performance::REPOSITORY
+            } else {
+                REPOSITORY
+            };
+            assert_eq!(result.matches(repository).count(), 1, "{result}");
+            assert!(
+                result.find("Performance").unwrap() < result.find(repository).unwrap(),
+                "{result}"
+            );
+            if tab == PackageTab::Performance {
+                assert!(!result.contains(REPOSITORY), "{result}");
+                assert!(!result.contains("no downloadable"), "{result}");
+            }
+        }
     }
 }

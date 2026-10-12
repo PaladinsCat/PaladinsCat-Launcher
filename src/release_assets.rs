@@ -1,5 +1,5 @@
 //! Immutable preview preparation; no publication or game installation.
-use paladinscat_launcher::{engine, ime};
+use paladinscat_launcher::{engine, ime, sources};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
@@ -51,8 +51,10 @@ pub fn assemble(
         );
     }
     fs::create_dir_all(&output).map_err(|e| e.to_string())?;
-    let base =
-        format!("https://github.com/PaladinsCat/PaladinsCat-locales/releases/download/{tag}");
+    let base = format!(
+        "{}/releases/download/{tag}",
+        sources::repository_url(sources::LOCALE_REPOSITORY)
+    );
     let mut package = cached.package;
     package.source_commit = locale_commit.into();
     package.game_build = ime_cached.package.game_build.clone();

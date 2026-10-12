@@ -1,6 +1,6 @@
 [package]
 name = "paladinscat-launcher"
-version = "0.3.2"
+version = "0.3.4"
 edition = "2024"
 default-run = "paladinscat-launcher"
 publish = false

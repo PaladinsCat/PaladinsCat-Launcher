@@ -18,8 +18,8 @@ fn run() -> engine::Result<()> {
         let mut options = launch::Options {
             game_root: PathBuf::from(&args[1]),
             tempest_cli: launch::default_tempest_cli(),
-            language: "KOR".into(),
-            homedir: "paladinslive".into(),
+            language: launch::DEFAULT_LANGUAGE.into(),
+            homedir: launch::DEFAULT_PROFILE.into(),
             performance: None,
             rollback_input: false,
         };
