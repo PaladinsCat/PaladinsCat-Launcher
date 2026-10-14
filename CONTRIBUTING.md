@@ -19,6 +19,9 @@ cargo run --locked --example verify_icon -- target/release/paladinscat-launcher.
 
 Run `paladinscat-launcher --preview OUTPUT.png`, `--preview-ime OUTPUT.png` or `--preview-performance OUTPUT.png` for a CPU layout preview. These do not open or capture a desktop window. Unit tests use temporary fixtures; they do not install game packages or load downloaded/game DLLs. Loader tests use owned synthetic Rust DLL fixtures.
 
+`--preview-details OUTPUT.png` and `--preview-details-kor OUTPUT.png` render the
+expanded repo panel with a synthetic launch result to review compact ENG/KOR copy.
+
 `assets/paladinscat.png` supplies both the native window icon and the generated Windows executable icon. The build wraps the original PNG in an ICO under Cargo's output directory; do not maintain a second logo asset. `verify_icon` reads the compiled PE icon as data and compares it with the original PNG without starting the launcher.
 
 Do not commit downloaded packages, generated binaries, recordings, credentials or game files. Keep `dist/` to one most-recent verified staging version; do not create per-test version directories. Recycle an older staged version only after its successor passes the checks above. Review and pin immutable package manifests and payload hashes before updating a release. Preserve existing game receipts and cache paths when changing product names. Keep launch selection distinct from verified runtime hook activation. No successful dry-run, build or CPU preview proves gameplay compatibility or performance.

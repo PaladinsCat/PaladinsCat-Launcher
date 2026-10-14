@@ -210,6 +210,7 @@ struct App {
     receiver: Option<Receiver<Event>>,
     status: String,
     status_parts: Vec<String>,
+    launch_log: Option<PathBuf>,
     installed: String,
     ime_releases: Vec<ime::Release>,
     ime_index: usize,
@@ -218,6 +219,7 @@ struct App {
     error: bool,
     logo: egui::TextureHandle,
     preview: bool,
+    preview_repository_open: bool,
     tab: PackageTab,
     catalog_status: String,
     catalog_connected: bool,
@@ -318,6 +320,7 @@ impl App {
             receiver: None,
             status: "Ready".into(),
             status_parts: Vec::new(),
+            launch_log: None,
             installed: if preview {
                 "Not inspected in CPU preview".into()
             } else {
@@ -335,6 +338,7 @@ impl App {
             error: false,
             logo,
             preview,
+            preview_repository_open: false,
             tab: PackageTab::Performance,
             catalog_status: "Catalog not checked".into(),
             catalog_connected: false,
@@ -383,6 +387,7 @@ impl App {
         self.error = false;
         self.status = "Preparing…".into();
         self.status_parts.clear();
+        self.launch_log = None;
         let repaint = ctx.clone();
         thread::spawn(move || {
             let progress = |message| {
@@ -429,6 +434,7 @@ impl App {
                 Event::Done(result) => {
                     self.receiver = None;
                     self.status_parts.clear();
+                    self.launch_log = None;
                     match result {
                         Ok(Work::Startup(startup)) => {
                             let mut failures = Vec::new();
@@ -537,6 +543,7 @@ impl App {
                                 result.status,
                                 format!("Launch log: {}", result.log.display()),
                             ];
+                            self.launch_log = Some(result.log);
                         }
                         Ok(Work::Message(message)) => self.status = message,
                         Err(error) => {
@@ -763,19 +770,22 @@ impl App {
         let (repository, source, status) = self.tab_source(self.tab);
         let id = ui.make_persistent_id("bottom-repository-details");
         let mut clicked = false;
-        let mut header =
-            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
-                .show_header(ui, |ui| {
-                    clicked = ui
-                        .add(
-                            egui::Label::new(language.text("Repository settings"))
-                                .sense(egui::Sense::click()),
-                        )
-                        .clicked();
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        self.clear_downloads_button(ui, ctx, busy);
-                    });
-                });
+        let mut header = egui::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            id,
+            self.preview && self.preview_repository_open,
+        )
+        .show_header(ui, |ui| {
+            clicked = ui
+                .add(
+                    egui::Label::new(language.text("Repository settings"))
+                        .sense(egui::Sense::click()),
+                )
+                .clicked();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.clear_downloads_button(ui, ctx, busy);
+            });
+        });
         if clicked {
             header.toggle();
         }
@@ -829,14 +839,41 @@ impl App {
                 });
             }
             ui.separator();
-            ui.label(
-                RichText::new(language.text("Details"))
-                    .size(12.)
-                    .color(MUTED),
-            );
-            ui.label(language.text(&self.status));
-            if !self.status_parts.is_empty() {
-                ui.label(self.presented_status(language));
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(language.text("Local path"))
+                        .size(12.)
+                        .color(MUTED),
+                );
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(engine::data_dir().display().to_string())
+                            .size(12.)
+                            .color(MUTED),
+                    )
+                    .wrap()
+                    .selectable(true),
+                );
+                if let Some(log) = &self.launch_log
+                    && ui
+                        .small_button(language.text("Copy log path"))
+                        .on_hover_text(log.display().to_string())
+                        .clicked()
+                {
+                    ui.ctx().copy_text(log.display().to_string());
+                }
+            });
+            if self.error || !self.status_parts.is_empty() {
+                egui::CollapsingHeader::new(language.text("Diagnostics"))
+                    .id_salt("backend-diagnostics")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(self.presented_status(language))
+                                .wrap()
+                                .selectable(true),
+                        );
+                    });
             }
         });
     }
@@ -877,7 +914,7 @@ impl App {
         }
     }
     // The default footer is a product surface, never a backend diagnostic sink.
-    // Every branch returns fixed, short copy; full payloads stay in opt-in details.
+    // Every branch returns fixed, short copy; full payloads require Diagnostics.
     fn concise_status(&self) -> &'static str {
         if self.error {
             if self.status == launch::LOCALIZATION_LANGUAGE_MISMATCH {
@@ -1524,11 +1561,16 @@ fn main() -> eframe::Result<()> {
                 | "--preview-performance-kor"
                 | "--preview-language-menu"
                 | "--preview-language-menu-kor"
+                | "--preview-details"
+                | "--preview-details-kor"
         )
     {
         preview::render(
             &PathBuf::from(&args[2]),
-            if args[1].contains("-performance") || args[1].contains("-language-menu") {
+            if args[1].contains("-performance")
+                || args[1].contains("-language-menu")
+                || args[1].contains("-details")
+            {
                 PackageTab::Performance
             } else if args[1].contains("-ime") {
                 PackageTab::Ime
@@ -1538,6 +1580,7 @@ fn main() -> eframe::Result<()> {
             args[1].ends_with("-prepared"),
             args[1].ends_with("-kor").then_some(UiLanguage::Korean),
             args[1].contains("-language-menu"),
+            args[1].contains("-details"),
         )
         .expect("Headless GUI preview");
         return Ok(());
@@ -2273,7 +2316,7 @@ mod tests {
     }
 
     #[test]
-    fn launch_footer_is_short_and_diagnostics_require_expanding_details() {
+    fn launch_summary_stays_short_when_repository_settings_are_expanded() {
         for language in [UiLanguage::English, UiLanguage::Korean] {
             for observed in [true, false] {
                 let ctx = egui::Context::default();
@@ -2308,6 +2351,25 @@ mod tests {
                     .find(|(text, _)| text == &language.text("Repository settings"))
                     .unwrap();
                 click_at_point(&mut app, &ctx, disclosure.center());
+                let text = rendered_text(&mut app, &ctx);
+                assert!(
+                    text.contains(&engine::data_dir().display().to_string()),
+                    "{text}"
+                );
+                assert!(text.contains(&language.text("Copy log path")), "{text}");
+                assert_eq!(text.matches(&language.text(expected)).count(), 1, "{text}");
+                assert!(
+                    !text.contains("63628")
+                        && !text.contains("initialization")
+                        && !text.contains("C:/logs/launch.log")
+                        && !text.contains(&language.text("Details")),
+                    "{text}"
+                );
+                let (_, diagnostics) = rendered_text_positions(&mut app, &ctx)
+                    .into_iter()
+                    .find(|(text, _)| text == &language.text("Diagnostics"))
+                    .unwrap();
+                click_at_point(&mut app, &ctx, diagnostics.center());
                 let text = rendered_text(&mut app, &ctx);
                 assert!(
                     text.contains(&language.text(diagnostic))
@@ -2449,6 +2511,12 @@ mod tests {
                         .find(|(text, _)| text == &language.text("Repository settings"))
                         .unwrap();
                     click_at_point(&mut app, &ctx, disclosure.center());
+                    assert!(!rendered_text(&mut app, &ctx).contains(diagnostic));
+                    let (_, diagnostics) = rendered_text_positions(&mut app, &ctx)
+                        .into_iter()
+                        .find(|(text, _)| text == &language.text("Diagnostics"))
+                        .unwrap();
+                    click_at_point(&mut app, &ctx, diagnostics.center());
                     let text = rendered_text(&mut app, &ctx);
                     assert!(text.contains(diagnostic), "{text}");
                     assert!(
@@ -2458,6 +2526,100 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn local_data_path_and_approved_repo_wording_show_on_every_expanded_tab() {
+        for language in [UiLanguage::English, UiLanguage::Korean] {
+            for tab in [
+                PackageTab::Performance,
+                PackageTab::Translation,
+                PackageTab::Ime,
+            ] {
+                let ctx = egui::Context::default();
+                ctx.global_style_mut(|style| style.animation_time = 0.);
+                let mut app = App::new(&ctx, true);
+                app.settings.ui_language = language;
+                app.tab = tab;
+                let path = engine::data_dir().display().to_string();
+                assert!(!rendered_text(&mut app, &ctx).contains(&path));
+                let caption = match language {
+                    UiLanguage::English => "Repository settings",
+                    UiLanguage::Korean => "레포 설정",
+                };
+                let (_, disclosure) = rendered_text_positions(&mut app, &ctx)
+                    .into_iter()
+                    .find(|(text, _)| text == caption)
+                    .unwrap();
+                click_at_point(&mut app, &ctx, disclosure.center());
+                let text = rendered_text(&mut app, &ctx);
+                assert!(text.contains(&path), "{text}");
+                assert!(text.contains(&language.text("Local path")), "{text}");
+                assert!(
+                    !text.contains("저장소") && !text.contains(&language.text("Details")),
+                    "{text}"
+                );
+                if language == UiLanguage::Korean && tab != PackageTab::Performance {
+                    assert!(text.contains("GitHub 레포"), "{text}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn copy_log_path_emits_the_exact_unicode_path_without_opening_a_file() {
+        let ctx = egui::Context::default();
+        ctx.global_style_mut(|style| style.animation_time = 0.);
+        let mut app = App::new(&ctx, true);
+        app.settings.ui_language = UiLanguage::Korean;
+        app.preview_repository_open = true;
+        let log = r"C:\Users\tester\로그 자료\launch,123.log";
+        app.launch_log = Some(PathBuf::from(log));
+        let (_, button) = rendered_text_positions(&mut app, &ctx)
+            .into_iter()
+            .find(|(text, _)| text == "로그 경로 복사")
+            .unwrap();
+        let point = button.center();
+        language_menu_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(880., 960.),
+                )),
+                events: vec![egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ui| app.render(ui),
+        );
+        output.textures_delta.clear();
+        assert!(output.platform_output.commands.iter().any(|command| {
+            matches!(command, egui::OutputCommand::CopyText(value) if value == log)
+        }));
+        assert!(
+            !output
+                .platform_output
+                .commands
+                .iter()
+                .any(|command| { matches!(command, egui::OutputCommand::OpenUrl(_)) })
+        );
     }
 
     #[test]
@@ -2651,6 +2813,12 @@ mod tests {
                 .find(|(text, _)| text == &language.text("Repository settings"))
                 .unwrap();
             click_at_point(&mut app, &ctx, disclosure.center());
+            assert!(!rendered_text(&mut app, &ctx).contains(warning));
+            let (_, diagnostics) = rendered_text_positions(&mut app, &ctx)
+                .into_iter()
+                .find(|(text, _)| text == &language.text("Diagnostics"))
+                .unwrap();
+            click_at_point(&mut app, &ctx, diagnostics.center());
             let text = rendered_text(&mut app, &ctx);
             assert!(text.contains(warning), "{text}");
             assert!(

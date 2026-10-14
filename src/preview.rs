@@ -11,6 +11,7 @@ pub fn render(
     prepared: bool,
     language: Option<super::UiLanguage>,
     menu_open: bool,
+    details_open: bool,
 ) -> Result<(), String> {
     let ctx = egui::Context::default();
     let mut app = super::App::new(&ctx, true);
@@ -29,6 +30,19 @@ pub fn render(
     }
     if menu_open {
         egui::Popup::open_id(&ctx, super::language_menu::popup_id());
+    }
+    if details_open {
+        app.preview_repository_open = true;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(super::Event::Done(Ok(super::Work::Launch(super::launch::LaunchResult {
+                launcher_pid: 36288,
+                game_pid: Some(36288),
+                log: super::engine::data_dir().join("launch-logs/launch-preview.log"),
+                status: "Game dispatched (PID 36288); fresh selected game observed (PID 36288). Mod initialization is not yet verified.".into(),
+            }))))
+            .map_err(|e| e.to_string())?;
+        app.receiver = Some(receiver);
     }
     // Review at the initial window size, with primary package controls visible.
     let size = [880usize, 960usize];

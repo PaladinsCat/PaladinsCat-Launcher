@@ -109,6 +109,7 @@ fn source_path(path: &str) -> bool {
             | "docs/download-cache.md"
             | "docs/verification-0.3.6.md"
             | "docs/verification-0.3.7.md"
+            | "docs/verification-0.3.8.md"
             | "docs/launcher-language-review.md"
     ) || (path.starts_with("src/") && path.ends_with(".rs"))
 }

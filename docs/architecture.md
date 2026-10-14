@@ -43,7 +43,10 @@ The game language is a dropdown, independent of the launcher and package
 languages. INT and KOR are offered; an existing saved locale code remains
 selectable. The footer uses fixed, concise localized states. Launch results
 show only Game started or Launch requested; raw process IDs, verification prose,
-paths and native errors are available only by expanding the bottom details.
+paths and native errors require opening Diagnostics inside the bottom section.
+Expanding Repository settings shows the selectable local data/downloads path
+and, after a launch, Copy log path. It does not repeat the footer status or expose
+backend launch prose. Korean repository labels use 레포.
 Backend/CLI diagnostics retain their full payloads. Headless interaction checks
 enforce the default disclosure boundary in both interface languages.
 

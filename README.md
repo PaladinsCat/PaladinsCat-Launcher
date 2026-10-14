@@ -15,7 +15,7 @@ Use **Restore originals** to revert localization. Disable performance for the ne
 
 The launcher starts the validated Windows x64 game executable and loads enabled DLLs directly. No Tempest installation is required. Existing Tempest-compatible profile and enabled-mod settings are retained.
 
-See [version 0.3.7 verification](docs/verification-0.3.7.md) for the recorded checks and their limits.
+See [version 0.3.8 verification](docs/verification-0.3.8.md) for the recorded checks and their limits.
 
 ## Development
 
