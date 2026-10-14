@@ -60,7 +60,14 @@ impl Fixture {
         };
         fs::write(source.join("Lang_KOR.dat"), bytes).unwrap();
         save(&source.join("bundle.json"), &package).unwrap();
-        import(&source.join("bundle.json"), &self.cache, &|_| {}).unwrap()
+        // These immutable inputs let transaction tests prepare several versions.
+        // Dedicated retention tests below use one shared download cache.
+        import(
+            &source.join("bundle.json"),
+            &self.home.join("prepared").join(name),
+            &|_| {},
+        )
+        .unwrap()
     }
     fn action(&self, action: Action, package: Option<Cached>) -> Result<String> {
         transition(action, &self.game, package, &self.cache, &|| false, &|_| {})
@@ -155,6 +162,180 @@ fn changed_game_file_is_retained_and_update_refused() {
     assert!(f.action(Action::Apply, Some(two)).is_err());
     assert_eq!(fs::read(&f.target).unwrap(), b"external modification");
     assert!(!recovery_pending(&f.game));
+}
+
+fn shared_package(f: &Fixture, name: &str, bytes: &[u8]) -> Cached {
+    let input = f.package(name, bytes);
+    import(&input.directory.join("bundle.json"), &f.cache, &|_| {}).unwrap()
+}
+
+#[test]
+fn latest_generation_prunes_old_downloads_and_failed_import_keeps_current() {
+    let f = Fixture::new();
+    let old = shared_package(&f, "retention-one", b"one");
+    let new = shared_package(&f, "retention-two", b"two");
+    assert!(!old.directory.exists());
+    assert!(!f.cache.join("artifacts").join(digest(b"one")).exists());
+    assert_eq!(fs::read_dir(f.cache.join("bundles")).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(f.cache.join("artifacts")).unwrap().count(), 1);
+    let bad = f.package("bad-generation", b"partial verified bytes");
+    let mut package = bad.package;
+    let mut second = package.files[0].clone();
+    second.source = "missing.KOR".into();
+    second.target = "ChaosGame/Localization/KOR/TgClient.KOR".into();
+    package.files.push(second);
+    save(&bad.directory.join("bundle.json"), &package).unwrap();
+    assert!(import(&bad.directory.join("bundle.json"), &f.cache, &|_| {}).is_err());
+    verify_cached(&new).unwrap();
+    assert_eq!(fs::read_dir(f.cache.join("artifacts")).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(f.cache.join("bundles")).unwrap().count(), 1);
+}
+
+#[test]
+fn clearing_downloads_preserves_install_and_allows_update_rollback_and_restore() {
+    let f = Fixture::new();
+    let one = shared_package(&f, "clear-one", b"one");
+    f.action(Action::Apply, Some(one)).unwrap();
+    crate::cache::clear_downloads(&f.cache).unwrap();
+    assert_eq!(fs::read(&f.target).unwrap(), b"one");
+    let two = shared_package(&f, "clear-two", b"two");
+    f.action(Action::Apply, Some(two)).unwrap();
+    crate::cache::clear_downloads(&f.cache).unwrap();
+    f.action(Action::Rollback, None).unwrap();
+    assert_eq!(fs::read(&f.target).unwrap(), b"one");
+    f.action(Action::Restore, None).unwrap();
+    assert_eq!(fs::read(&f.target).unwrap(), b"original");
+    assert_eq!(fs::read_dir(f.cache.join("artifacts")).unwrap().count(), 0);
+    let recovery = f.game.join(STATE).join("recovery-cache/bundles");
+    assert!(fs::read_dir(recovery).unwrap().count() <= 1);
+}
+
+#[test]
+fn restore_after_clear_checks_live_data_and_original_backups() {
+    let f = Fixture::new();
+    let one = shared_package(&f, "restore-one", b"one");
+    f.action(Action::Apply, Some(one)).unwrap();
+    crate::cache::clear_downloads(&f.cache).unwrap();
+    fs::write(&f.target, b"foreign modification").unwrap();
+    assert!(f.action(Action::Restore, None).is_err());
+    assert_eq!(fs::read(&f.target).unwrap(), b"foreign modification");
+    fs::write(&f.target, b"one").unwrap();
+    let active: Active = json(&f.game.join(STATE).join("active.json")).unwrap();
+    fs::write(&active.files[0].backup, b"corrupted original").unwrap();
+    assert!(f.action(Action::Restore, None).is_err());
+    assert_eq!(fs::read(&f.target).unwrap(), b"one");
+}
+
+#[test]
+fn interrupted_update_recovers_from_game_checkpoint_after_download_cache_loss() {
+    let f = Fixture::new();
+    let one = shared_package(&f, "crash-one", b"one");
+    f.action(Action::Apply, Some(one)).unwrap();
+    let two = shared_package(&f, "crash-two", b"two");
+    let root = f.game.canonicalize().unwrap();
+    let previous = snapshot(&root, &f.cache).unwrap();
+    save(
+        &root.join(STATE).join("patcher-journal.json"),
+        &Journal {
+            previous,
+            next: Some(two.clone()),
+        },
+    )
+    .unwrap();
+    assert!(crate::cache::clear_downloads(&f.cache).is_err());
+    upk_patcher::revert_bundle(root.to_str().unwrap()).unwrap();
+    upk_patcher::apply_bundle(&two.directory, "KOR", root.to_str().unwrap()).unwrap();
+    fs::rename(&f.cache, f.home.join("lost-download-cache")).unwrap();
+    f.action(Action::Recover, None).unwrap();
+    assert_eq!(fs::read(&f.target).unwrap(), b"one");
+    assert!(!recovery_pending(&f.game));
+}
+
+#[test]
+fn repeated_updates_keep_one_previous_checkpoint_and_no_old_downloads() {
+    let f = Fixture::new();
+    for index in 0..5 {
+        let p = shared_package(
+            &f,
+            &format!("bounded-{index}"),
+            format!("translation-{index}").as_bytes(),
+        );
+        f.action(Action::Apply, Some(p)).unwrap();
+        assert_eq!(fs::read_dir(f.cache.join("bundles")).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(f.cache.join("artifacts")).unwrap().count(), 1);
+        if index > 0 {
+            assert_eq!(
+                fs::read_dir(f.game.join(STATE).join("recovery-cache/bundles"))
+                    .unwrap()
+                    .count(),
+                1
+            );
+            assert_eq!(
+                fs::read_dir(f.game.join(STATE).join("recovery-cache/artifacts"))
+                    .unwrap()
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn post_commit_cleanup_failure_never_claims_pending_install_recovery() {
+    let f = Fixture::new();
+    for (name, bytes) in [
+        ("cleanup-a", b"one".as_slice()),
+        ("cleanup-b", b"two".as_slice()),
+    ] {
+        let p = shared_package(&f, name, bytes);
+        f.action(Action::Apply, Some(p)).unwrap();
+    }
+    fs::write(
+        f.game
+            .join(STATE)
+            .join("recovery-cache/recycle-failure-fixture"),
+        b"fixture",
+    )
+    .unwrap();
+    let p = shared_package(&f, "cleanup-c", b"three");
+    let message = f.action(Action::Apply, Some(p)).unwrap();
+    assert!(message.contains("Applied cleanup-c"));
+    assert!(message.contains("cleanup pending"));
+    assert!(!message.contains("Recovery required"));
+    assert!(!recovery_pending(&f.game));
+    assert_eq!(fs::read(&f.target).unwrap(), b"three");
+    let active: Active = json(&f.game.join(STATE).join("active.json")).unwrap();
+    assert_eq!(active.bundle_id, "cleanup-c");
+}
+
+#[test]
+fn unchanged_content_is_reused_across_package_versions() {
+    let f = Fixture::new();
+    let old = shared_package(&f, "reuse-one", b"same bytes");
+    let path = f.cache.join("artifacts").join(digest(b"same bytes"));
+    let before = fs::metadata(&path).unwrap().modified().unwrap();
+    let new = shared_package(&f, "reuse-two", b"same bytes");
+    assert!(!old.directory.exists());
+    verify_cached(&new).unwrap();
+    assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), before);
+    assert_eq!(fs::read_dir(f.cache.join("artifacts")).unwrap().count(), 1);
+}
+
+#[test]
+fn verified_new_package_remains_usable_when_retired_cache_cannot_be_recycled() {
+    let f = Fixture::new();
+    let old = shared_package(&f, "prune-warning-old", b"same");
+    fs::write(f.cache.join("recycle-partial-failure-fixture"), b"fixture").unwrap();
+    let prepared = shared_package(&f, "prune-warning-new", b"same");
+    assert!(!old.directory.exists());
+    verify_cached(&prepared).unwrap();
+    assert_eq!(prepared.package.bundle_id, "prune-warning-new");
+    assert!(
+        crate::cache::take_cleanup_warning()
+            .unwrap()
+            .contains("cleanup pending")
+    );
+    assert!(crate::cache::take_cleanup_warning().is_none());
 }
 #[test]
 fn incompatible_game_fingerprint_blocks_before_transaction() {

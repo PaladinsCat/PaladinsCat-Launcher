@@ -196,6 +196,8 @@ fn verify_cached(c: &Cached) -> Result<()> {
     payload(&c.directory.join(DLL), &c.package)
 }
 pub fn download(r: &Release, cache: &Path, progress: Progress<'_>) -> Result<Cached> {
+    let _lease = crate::cache::lock(cache)?;
+    let mut attempt = crate::cache::Attempt::begin(cache, &["ime"])?;
     validate_release(r)?;
     let dir = cache.join("ime").join(&r.manifest_sha256);
     fs::create_dir_all(&dir).map_err(error)?;
@@ -228,9 +230,14 @@ pub fn download(r: &Release, cache: &Path, progress: Progress<'_>) -> Result<Cac
         directory: dir,
     };
     verify_cached(&c)?;
+    attempt.commit();
+    crate::cache::prepared_cleanup(crate::cache::retain_family(cache, "ime", &c.directory));
+    crate::cache::prepared_cleanup(crate::cache::retain_ime_files(cache, &c.directory));
     Ok(c)
 }
 pub fn import(path: &Path, cache: &Path) -> Result<Cached> {
+    let _lease = crate::cache::lock(cache)?;
+    let mut attempt = crate::cache::Attempt::begin(cache, &["ime"])?;
     let p: Package = read(path)?;
     validate(&p)?;
     let source = path.parent().ok_or("IME package has no parent")?.join(DLL);
@@ -250,6 +257,9 @@ pub fn import(path: &Path, cache: &Path) -> Result<Cached> {
         directory: dir,
     };
     verify_cached(&c)?;
+    attempt.commit();
+    crate::cache::prepared_cleanup(crate::cache::retain_family(cache, "ime", &c.directory));
+    crate::cache::prepared_cleanup(crate::cache::retain_ime_files(cache, &c.directory));
     Ok(c)
 }
 pub fn prepare(dll: &Path, output: &Path, release_version: &str) -> Result<Package> {
@@ -460,6 +470,17 @@ fn operate_with(
     progress: Progress<'_>,
     running: &dyn Fn() -> bool,
 ) -> Result<String> {
+    let _cache_lease = selected
+        .as_ref()
+        .map(|c| {
+            let owner = c
+                .directory
+                .parent()
+                .and_then(Path::parent)
+                .ok_or("IME cache owner missing")?;
+            crate::cache::lock(owner)
+        })
+        .transpose()?;
     let (root, _lock) = engine::acquire(root, running)?;
     safe(&root, &format!("{STATE}/ime-journal.json"))?;
     if matches!(action, Action::Recover) {
@@ -563,7 +584,7 @@ fn operate_with(
     }
     Ok(if let Some(p) = next {
         format!(
-            "IME {} installed and verified · loaded by Tempest on the next launch",
+            "IME {} installed and verified · loaded by launcher on next launch",
             p.version
         )
     } else {

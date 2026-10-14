@@ -1,6 +1,6 @@
 [package]
 name = "paladinscat-launcher"
-version = "0.3.5"
+version = "0.3.7"
 edition = "2024"
 default-run = "paladinscat-launcher"
 publish = false
@@ -9,7 +9,7 @@ repository = "https://github.com/PaladinsCat/PaladinsCat-Launcher"
 description = "PaladinsCat Launcher"
 
 [dependencies]
-eframe = { version = "=0.36.2", default-features = false, features = ["default_fonts", "wgpu"] }
+eframe = { version = "=0.36.2", default-features = false, features = ["default_fonts", "wgpu", "glow"] }
 egui = "=0.36.2"
 pollster = "0.4"
 rfd = "0.15"
@@ -23,6 +23,13 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [build-dependencies]
 winresource = "=0.1.31"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+windows = { version = "=0.62.2", features = ["Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_System_Com", "Win32_UI_Shell"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "=0.62.2", features = ["Win32_System_Com", "Win32_System_TaskScheduler", "Win32_System_Variant", "Win32_System_Ole"] }
 
 [[bin]]
 name = "patcher-assets"

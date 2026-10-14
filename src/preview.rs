@@ -5,7 +5,13 @@ use egui::{
 };
 use std::{collections::HashMap, path::Path};
 
-pub fn render(path: &Path, tab: super::PackageTab, prepared: bool) -> Result<(), String> {
+pub fn render(
+    path: &Path,
+    tab: super::PackageTab,
+    prepared: bool,
+    language: Option<super::UiLanguage>,
+    menu_open: bool,
+) -> Result<(), String> {
     let ctx = egui::Context::default();
     let mut app = super::App::new(&ctx, true);
     if prepared {
@@ -18,14 +24,22 @@ pub fn render(path: &Path, tab: super::PackageTab, prepared: bool) -> Result<(),
         app.receiver = Some(receiver);
     }
     app.tab = tab;
+    if let Some(language) = language {
+        app.settings.ui_language = language;
+    }
+    if menu_open {
+        egui::Popup::open_id(&ctx, super::language_menu::popup_id());
+    }
     // Review at the initial window size, with primary package controls visible.
     let size = [880usize, 960usize];
     let mut textures: HashMap<egui::TextureId, egui::ColorImage> = HashMap::new();
     let mut output = None;
     // Fonts/layout may request a second pass; retain texture updates across passes.
-    for _ in 0..3 {
-        let frame = ctx.run_ui(
+    for pass in 0..3 {
+        let mut frame = ctx.run_ui(
             egui::RawInput {
+                // Settle the popup's ordinary fade animation in CPU previews.
+                time: Some(pass as f64 * 0.25),
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
                     egui::vec2(size[0] as f32, size[1] as f32),
@@ -51,6 +65,8 @@ pub fn render(path: &Path, tab: super::PackageTab, prepared: bool) -> Result<(),
                 }
             }
         }
+        // Texture deltas were applied to the CPU texture store above.
+        frame.textures_delta.clear();
         output = Some(frame);
     }
     let output = output.unwrap();

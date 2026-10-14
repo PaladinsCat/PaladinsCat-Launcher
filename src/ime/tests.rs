@@ -208,8 +208,8 @@ fn publishing_identical_draft_updates_receipt_without_replacing_mod() {
 fn interrupted_update_after_new_mod_is_installed_restores_previous_mod() {
     let f = Fixture::new();
     let old = f.package("0.1.0", 1);
-    let next = f.package("0.2.0", 2);
     f.run(Action::Apply, Some(old.clone())).unwrap();
+    let next = f.package("0.2.0", 2);
     let root = f.game.canonicalize().unwrap();
     let archive = ".watchcat-localization/ime-archive/interrupted-after-install";
     fs::rename(root.join(TARGET), root.join(archive)).unwrap();

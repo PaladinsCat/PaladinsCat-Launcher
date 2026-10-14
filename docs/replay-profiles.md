@@ -1,6 +1,6 @@
 # Replay files and game profiles
 
-The launcher defaults to language `INT` and profile `PaladinsCat`. The profile is forwarded through Tempest's `--homedir`, which becomes the game's `-homedir` argument. Existing explicit settings remain selected.
+The launcher defaults to language `INT` and profile `PaladinsCat`. Its standalone Rust backend passes the profile as the game's `-homedir` argument. Existing explicit settings remain selected, including settings saved before the installed Tempest CLI dependency was removed.
 
 ## Storage and playback
 
@@ -10,7 +10,7 @@ Wolper Replay's installed documentation specifies `.demo` recordings in the norm
 <Documents>\My Games\<profile>\ChaosGame\Demos
 ```
 
-Use the Windows Documents known folder; it can be redirected. Recordings belong to the selected profile, while Tempest's enabled mod registry belongs to the game installation. A loaded replay mod does not make another profile's recording library available.
+Use the Windows Documents known folder; it can be redirected. Recordings belong to the selected profile, while the compatible `.tempest/mods/mods.json` enabled-mod registry belongs to the game installation. The standalone launcher reads that registry without requiring a Tempest application. A loaded replay mod does not make another profile's recording library available.
 
 Changing profiles does not migrate recordings. The new `PaladinsCat` home can therefore initially have no recordings even when another profile contains them. Different profile settings and client/mod builds may also affect playback; path isolation alone does not establish the cause of a particular failed load.
 
@@ -22,7 +22,7 @@ No automatic migration or replay importer is implemented in this launcher versio
 
 ## Source evidence
 
-Tempest source inspected at `01081efe3cd966dbc8f84822640b10f12f3f4158`:
+Historical Tempest source evidence at `01081efe3cd966dbc8f84822640b10f12f3f4158` documents the compatible profile and registry layout retained by the standalone launcher:
 
 - [Frontend profile selection](https://github.com/LowRezStudio/Tempest/blob/01081efe3cd966dbc8f84822640b10f12f3f4158/Tempest.Launcher/src/lib/core/launch.ts#L29-L36): its Season 8.1 frontend selects `Paladins`; other versions derive a sanitized name.
 - [CLI game arguments](https://github.com/LowRezStudio/Tempest/blob/01081efe3cd966dbc8f84822640b10f12f3f4158/Tempest.CLI/Launcher/LauncherCommands.cs#L96-L109): with default arguments enabled, forwards the selected homedir; a missing value defaults to `Tempest`.

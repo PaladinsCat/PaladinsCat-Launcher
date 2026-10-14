@@ -1,4 +1,5 @@
 //! Local release preparation only. Never pushes, publishes or applies a package.
+mod launcher_release;
 mod release_assets;
 use paladinscat_launcher::{engine, ime};
 use sha2::{Digest, Sha256};
@@ -78,6 +79,49 @@ fn validate(root: &Path) -> Result<(), String> {
 
 fn main() -> Result<(), String> {
     let args: Vec<_> = env::args().skip(1).collect();
+    if let [mode, binaries, output, source_commit, catalog] = args.as_slice()
+        && mode == "prepare-launcher"
+    {
+        let output = launcher_release::prepare(
+            Path::new(binaries),
+            Path::new(output),
+            source_commit,
+            Path::new(catalog),
+        )?;
+        println!(
+            "Prepared launcher preview at {}; nothing published or installed",
+            output.display()
+        );
+        return Ok(());
+    }
+    if let [mode, path] = args.as_slice()
+        && mode == "validate-catalog"
+    {
+        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        let catalog = engine::parse_catalog(&bytes)?;
+        println!(
+            "Validated catalog: {} locale / {} IME releases",
+            catalog.packages.len(),
+            catalog.ime_packages.len()
+        );
+        return Ok(());
+    }
+    if let [mode, bundle, repo, tag, locale_commit, notes] = args.as_slice()
+        && mode == "assemble-locale-preview"
+    {
+        let output = release_assets::assemble_locale(
+            Path::new(bundle),
+            &repository(repo)?,
+            tag,
+            locale_commit,
+            notes,
+        )?;
+        println!(
+            "Prepared immutable locale preview at {}; IME retained; nothing published or installed",
+            output.display()
+        );
+        return Ok(());
+    }
     if let [
         mode,
         bundle,

@@ -1,5 +1,5 @@
 //! Explicit CLI operations for package preparation and read-only launch checks.
-use paladinscat_launcher::{engine, launch, performance};
+use paladinscat_launcher::{engine, graphics_policy, launch, performance};
 use std::path::PathBuf;
 
 fn run() -> engine::Result<()> {
@@ -8,16 +8,33 @@ fn run() -> engine::Result<()> {
         println!("{}", engine::data_dir().display());
         return Ok(());
     }
+    if args.as_slice() == ["--pin-rtx-5080"] {
+        let path = engine::data_dir().join("graphics-policy.json");
+        graphics_policy::write_rtx_5080_policy(&path)?;
+        println!("RTX 5080 graphics policy saved at {}", path.display());
+        return Ok(());
+    }
     if args.len() == 2 && args[0] == "download-performance" {
         let cached =
             performance::download(&PathBuf::from(&args[1]), &|message| println!("{message}"))?;
         println!("{}", performance::manifest_path(&cached).display());
         return Ok(());
     }
+    if args.len() == 2 && args[0] == "--restore" {
+        let game = PathBuf::from(&args[1]);
+        let status = engine::operate(
+            engine::Action::Restore,
+            &game,
+            None,
+            &engine::data_dir(),
+            &|message| println!("{message}"),
+        )?;
+        println!("{status}");
+        return Ok(());
+    }
     if args.len() >= 2 && matches!(args[0].as_str(), "--dry-run" | "--launch") {
         let mut options = launch::Options {
             game_root: PathBuf::from(&args[1]),
-            tempest_cli: launch::default_tempest_cli(),
             language: launch::DEFAULT_LANGUAGE.into(),
             homedir: launch::DEFAULT_PROFILE.into(),
             performance: None,
@@ -44,7 +61,6 @@ fn run() -> engine::Result<()> {
                 }
                 "--language" => options.language.clone_from(value),
                 "--profile" => options.homedir.clone_from(value),
-                "--tempest-cli" => options.tempest_cli = value.into(),
                 _ => return Err("Unknown launcher option".into()),
             }
             index += 2;
@@ -54,11 +70,11 @@ fn run() -> engine::Result<()> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
-                    "tempest_cli": plan.tempest_cli,
+                    "game_executable": plan.game_executable,
                     "game_root": plan.game_root,
                     "working_directory": plan.working_directory,
                     "args": plan.args,
-                    "verified_dlls": plan.dlls,
+                    "load_dlls": plan.dlls,
                     "game_launched": false,
                     "hooks_verified": false
                 }))
@@ -70,7 +86,7 @@ fn run() -> engine::Result<()> {
         }
         return Ok(());
     }
-    Err("Usage: paladinscat-launcher-cli --data-dir | download-performance CACHE | --dry-run|--launch GAME_ROOT [--performance MANIFEST] [--previous-input] [--language KOR|INT] [--profile NAME] [--tempest-cli EXE]".into())
+    Err("Usage: paladinscat-launcher-cli --data-dir | --pin-rtx-5080 | download-performance CACHE | --restore GAME_ROOT | --dry-run|--launch GAME_ROOT [--performance MANIFEST] [--previous-input] [--language KOR|INT] [--profile NAME]".into())
 }
 fn main() {
     if let Err(error) = run() {

@@ -415,6 +415,10 @@ pub fn parse_catalog(bytes: &[u8]) -> Result<Catalog> {
     Ok(catalog)
 }
 pub fn download(release: &Release, cache: &Path, progress: Progress<'_>) -> Result<Cached> {
+    let _lease = crate::cache::lock(cache)?;
+    crate::cache::no_pending_transactions(cache)?;
+    let mut attempt =
+        crate::cache::Attempt::begin(cache, &["artifacts", "bundles", "downloads", "manifests"])?;
     hash(&release.manifest_sha256)?;
     if !id(&release.bundle_id) || !id(&release.locale) {
         return Err("Invalid release identity".into());
@@ -491,9 +495,20 @@ pub fn download(release: &Release, cache: &Path, progress: Progress<'_>) -> Resu
         }
         fs::rename(part, destination).map_err(err)?;
     }
-    materialize(package, cache)
+    let cached = materialize(package, cache)?;
+    attempt.commit();
+    crate::cache::prepared_cleanup(crate::cache::retain_translations(
+        cache,
+        &[&cached],
+        Some(&release.manifest_sha256),
+    ));
+    Ok(cached)
 }
 pub fn import(path: &Path, cache: &Path, progress: Progress<'_>) -> Result<Cached> {
+    let _lease = crate::cache::lock(cache)?;
+    crate::cache::no_pending_transactions(cache)?;
+    let mut attempt =
+        crate::cache::Attempt::begin(cache, &["artifacts", "bundles", "downloads", "manifests"])?;
     let package: Package = json(path)?;
     validate(&package)?;
     let root = path
@@ -511,7 +526,10 @@ pub fn import(path: &Path, cache: &Path, progress: Progress<'_>) -> Result<Cache
             &file.artifact_sha256,
         )?;
     }
-    materialize(package, cache)
+    let cached = materialize(package, cache)?;
+    attempt.commit();
+    crate::cache::prepared_cleanup(crate::cache::retain_translations(cache, &[&cached], None));
+    Ok(cached)
 }
 fn cache_artifact(source: &Path, destination: &Path, expected: &str) -> Result<()> {
     if destination.exists() {
@@ -577,7 +595,7 @@ pub fn installed(root: &Path) -> Result<String> {
 pub fn recovery_pending(root: &Path) -> bool {
     root.join(STATE).join("patcher-journal.json").exists()
 }
-fn snapshot(root: &Path, cache: &Path) -> Result<Option<Cached>> {
+fn snapshot(root: &Path, _cache: &Path) -> Result<Option<Cached>> {
     let path = root.join(STATE).join("active.json");
     if !path.exists() {
         return Ok(None);
@@ -600,11 +618,6 @@ fn snapshot(root: &Path, cache: &Path) -> Result<Option<Cached>> {
         }
         upk_patcher::require_hash(&file.backup, &file.stock_sha256, "original backup")?;
         upk_patcher::require_hash(&file.target, &file.artifact_sha256, "installed artifact")?;
-        cache_artifact(
-            &file.target,
-            &cache.join("artifacts").join(&file.artifact_sha256),
-            &file.artifact_sha256,
-        )?;
         let relative = file
             .target
             .strip_prefix(root)
@@ -620,7 +633,7 @@ fn snapshot(root: &Path, cache: &Path) -> Result<Option<Cached>> {
             download: None,
         });
     }
-    let previous = Package {
+    let mut previous = Package {
         version: 1,
         bundle_id: active.bundle_id,
         locale: active.locale,
@@ -652,11 +665,48 @@ fn snapshot(root: &Path, cache: &Path) -> Result<Option<Cached>> {
             if !same {
                 return Err("Selected package differs from installed receipt".into());
             }
-            verify_cached(&selected)?;
-            return Ok(Some(selected));
+            // Selection metadata remains useful when old downloads were cleared.
+            // Rebuild its bytes only from the independently verified live receipt.
+            validate(&selected.package)?;
+            previous = selected.package;
         }
     }
-    materialize(previous, cache).map(Some)
+    let recovery = root.join(STATE).join("recovery-cache");
+    let _recovery_lease = crate::cache::lock(&recovery)?;
+    for file in &previous.files {
+        cache_artifact(
+            &contained(root, &file.target)?,
+            &recovery.join("artifacts").join(&file.artifact_sha256),
+            &file.artifact_sha256,
+        )?;
+    }
+    let cached = materialize(previous, &recovery)?;
+    prune_recovery(root, Some(&cached))?;
+    Ok(Some(cached))
+}
+
+fn prune_recovery(root: &Path, checkpoint: Option<&Cached>) -> Result<()> {
+    let recovery = root.join(STATE).join("recovery-cache");
+    if !recovery.exists() {
+        return Ok(());
+    }
+    let recovery = recovery.canonicalize().map_err(err)?;
+    let mut retained = Vec::new();
+    if let Some(checkpoint) = checkpoint {
+        retained.push(checkpoint.clone());
+    }
+    let rollback_path = root.join(STATE).join("rollback-package.json");
+    if rollback_path.exists() {
+        let rollback: Option<Cached> = json(&rollback_path)?;
+        if let Some(rollback) = rollback
+            && rollback.directory.starts_with(&recovery)
+            && retained.iter().all(|p| p.directory != rollback.directory)
+        {
+            verify_cached(&rollback)?;
+            retained.push(rollback);
+        }
+    }
+    crate::cache::retain_translations(&recovery, &retained.iter().collect::<Vec<_>>(), None)
 }
 
 #[cfg(test)]
@@ -751,15 +801,27 @@ pub(crate) fn acquire(root: &Path, running: &dyn Fn() -> bool) -> Result<(PathBu
         .map_err(|_| "Another patch operation is using this installation".to_string())?;
     Ok((root, lock))
 }
-fn finish(root: &Path, selected: &Option<Cached>) -> Result<()> {
+fn finish(root: &Path, selected: &Option<Cached>) -> Result<Option<String>> {
     save(&root.join(STATE).join("selected-package.json"), selected)?;
     fs::rename(
         root.join(STATE).join("patcher-journal.json"),
         root.join(STATE).join(format!("completed-{}.json", stamp())),
     )
-    .map_err(err)
+    .map_err(err)?;
+    // Keep only the one previous-version checkpoint; completed journals don't pin data.
+    let checkpoint = selected.as_ref().filter(|cached| {
+        cached
+            .directory
+            .starts_with(root.join(STATE).join("recovery-cache"))
+    });
+    // Once the journal is completed, recycling is maintenance, not install failure.
+    Ok(prune_recovery(root, checkpoint).err())
 }
-fn recover_inner(root: &Path, running: &dyn Fn() -> bool, progress: Progress<'_>) -> Result<()> {
+fn recover_inner(
+    root: &Path,
+    running: &dyn Fn() -> bool,
+    progress: Progress<'_>,
+) -> Result<Option<String>> {
     let journal: Journal = json(&root.join(STATE).join("patcher-journal.json"))?;
     if let Some(previous) = &journal.previous {
         verify_cached(previous)?;
@@ -817,10 +879,15 @@ fn transition(
     running: &dyn Fn() -> bool,
     progress: Progress<'_>,
 ) -> Result<String> {
+    let _cache_lease = crate::cache::lock(cache)?;
     let (root, _lock) = acquire(game, running)?;
+    crate::cache::register_game(cache, &root)?;
     if matches!(action, Action::Recover) {
-        recover_inner(&root, running, progress)?;
-        return Ok("Recovered the previous installation".into());
+        let warning = recover_inner(&root, running, progress)?;
+        return Ok(with_cleanup_warning(
+            "Recovered the previous installation".into(),
+            warning,
+        ));
     }
     if recovery_pending(&root) {
         return Err("Recover the interrupted operation first".into());
@@ -865,15 +932,29 @@ fn transition(
         save(&root.join(STATE).join("rollback-package.json"), &previous)?;
         finish(&root, &next)
     })();
-    if let Err(error) = result {
-        return Err(match recover_inner(&root, running, progress) {
-            Ok(()) => format!("Operation failed; previous installation restored: {error}"),
-            Err(recovery) => format!("{error}. Recovery required: {recovery}"),
-        });
-    }
-    Ok(if let Some(next) = next {
+    let warning = match result {
+        Ok(warning) => warning,
+        Err(error) => {
+            return Err(match recover_inner(&root, running, progress) {
+                Ok(warning) => with_cleanup_warning(
+                    format!("Operation failed; previous installation restored: {error}"),
+                    warning,
+                ),
+                Err(recovery) => format!("{error}. Recovery required: {recovery}"),
+            });
+        }
+    };
+    let message = if let Some(next) = next {
         format!("Applied {} · all files verified", next.package.bundle_id)
     } else {
         "Original game files restored and verified".into()
-    })
+    };
+    Ok(with_cleanup_warning(message, warning))
+}
+
+fn with_cleanup_warning(message: String, warning: Option<String>) -> String {
+    warning.map_or_else(
+        || message.clone(),
+        |error| format!("{message} · recovery cache cleanup pending: {error}"),
+    )
 }

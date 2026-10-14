@@ -1,8 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod graphics_device;
+mod i18n;
+mod language_menu;
 mod preview;
-use paladinscat_launcher::{engine, ime, launch, performance, sources};
+mod vm_renderer;
+use i18n::UiLanguage;
+use paladinscat_launcher::{cache, engine, ime, launch, performance, sources};
 use sources::{LOCALE_REPOSITORY as REPOSITORY, catalog_url};
 
 use egui::{Color32, FontFamily, FontId, RichText};
@@ -22,6 +26,8 @@ const ACCENT: Color32 = Color32::from_rgb(100, 186, 177);
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Settings {
+    #[serde(default)]
+    ui_language: UiLanguage,
     game_folder: String,
     repository: String,
     catalog_url: String,
@@ -35,15 +41,10 @@ struct Settings {
     performance_enabled: bool,
     #[serde(default)]
     rollback_input: bool,
-    #[serde(default = "default_cli")]
-    tempest_cli: String,
     #[serde(default = "default_language")]
     launch_language: String,
     #[serde(default = "default_homedir")]
     homedir: String,
-}
-fn default_cli() -> String {
-    launch::default_tempest_cli().display().to_string()
 }
 fn default_language() -> String {
     launch::DEFAULT_LANGUAGE.into()
@@ -54,6 +55,7 @@ fn default_homedir() -> String {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            ui_language: UiLanguage::default(),
             game_folder: String::new(),
             repository: REPOSITORY.into(),
             catalog_url: catalog_url(REPOSITORY),
@@ -62,7 +64,6 @@ impl Default for Settings {
             prepared_performance: String::new(),
             performance_enabled: false,
             rollback_input: false,
-            tempest_cli: default_cli(),
             launch_language: default_language(),
             homedir: default_homedir(),
         }
@@ -71,6 +72,10 @@ impl Default for Settings {
 enum Event {
     Progress(String),
     Done(std::result::Result<Work, String>),
+    CleanupWarning(String),
+    // Deliver completion and its optional warning atomically. Done processing
+    // drops the channel receiver, so a later separate send could lose a warning.
+    Completion(std::result::Result<Work, String>, Option<String>),
 }
 enum Work {
     Startup(Startup),
@@ -78,13 +83,22 @@ enum Work {
     Package(Box<Cached>),
     ImePackage(Box<ime::Cached>),
     PerformancePackage(Box<performance::Cached>),
+    DownloadsCleared(engine::Result<()>),
+    Launch(launch::LaunchResult),
     Message(String),
 }
 struct Startup {
+    prepared: PreparedPaths,
     catalog: engine::Result<engine::Catalog>,
     translation: Option<engine::Result<Box<Cached>>>,
     ime: Option<engine::Result<Box<ime::Cached>>>,
     performance: Option<engine::Result<Box<performance::Cached>>>,
+}
+#[derive(Default)]
+struct PreparedPaths {
+    translation: String,
+    ime: String,
+    performance: String,
 }
 impl Startup {
     fn load(settings: &Settings, cache: &std::path::Path, progress: engine::Progress<'_>) -> Self {
@@ -103,6 +117,11 @@ impl Startup {
             performance::import(&PathBuf::from(&settings.prepared_performance), cache).map(Box::new)
         });
         Self {
+            prepared: PreparedPaths {
+                translation: settings.prepared_translation.clone(),
+                ime: settings.prepared_ime.clone(),
+                performance: settings.prepared_performance.clone(),
+            },
             catalog,
             translation,
             ime,
@@ -190,6 +209,7 @@ struct App {
     selected: Option<Cached>,
     receiver: Option<Receiver<Event>>,
     status: String,
+    status_parts: Vec<String>,
     installed: String,
     ime_releases: Vec<ime::Release>,
     ime_index: usize,
@@ -297,6 +317,7 @@ impl App {
             selected: None,
             receiver: None,
             status: "Ready".into(),
+            status_parts: Vec::new(),
             installed: if preview {
                 "Not inspected in CPU preview".into()
             } else {
@@ -336,6 +357,7 @@ impl App {
         if let Err(error) = result {
             self.error = true;
             self.status = format!("Could not save settings: {error}");
+            self.status_parts.clear();
         }
     }
     fn refresh_installed(&mut self) {
@@ -360,6 +382,7 @@ impl App {
         self.receiver = Some(receiver);
         self.error = false;
         self.status = "Preparing…".into();
+        self.status_parts.clear();
         let repaint = ctx.clone();
         thread::spawn(move || {
             let progress = |message| {
@@ -370,7 +393,8 @@ impl App {
                 .unwrap_or_else(|_| {
                     Err("Operation interrupted; use Recover if a transaction is pending".into())
                 });
-            let _ = sender.send(Event::Done(result));
+            let cleanup_warning = cache::take_cleanup_warning();
+            let _ = sender.send(Event::Completion(result, cleanup_warning));
             repaint.request_repaint();
         });
     }
@@ -378,16 +402,37 @@ impl App {
         let events: Vec<_> = self
             .receiver
             .as_ref()
-            .map(|r| r.try_iter().collect())
+            .map(|r| {
+                r.try_iter()
+                    .flat_map(|event| match event {
+                        Event::Completion(result, warning) => {
+                            let mut events = vec![Event::Done(result)];
+                            events.extend(warning.map(Event::CleanupWarning));
+                            events
+                        }
+                        event => vec![event],
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         for event in events {
             match event {
-                Event::Progress(message) => self.status = message,
+                Event::Progress(message) => {
+                    self.status = message;
+                    self.status_parts.clear();
+                }
+                Event::CleanupWarning(message) => {
+                    self.status_parts
+                        .push(format!("Download cache cleanup: {message}"));
+                }
+                Event::Completion(..) => unreachable!("Worker completion was expanded above"),
                 Event::Done(result) => {
                     self.receiver = None;
+                    self.status_parts.clear();
                     match result {
                         Ok(Work::Startup(startup)) => {
                             let mut failures = Vec::new();
+                            let mut invalidated = false;
                             match startup.catalog {
                                 Ok(catalog) => self.accept_catalog(catalog),
                                 Err(error) => {
@@ -400,6 +445,10 @@ impl App {
                                 match result {
                                     Ok(package) => self.accept_translation(*package),
                                     Err(error) => {
+                                        invalidated |= self.forget_stale_prepared(
+                                            PackageTab::Translation,
+                                            &startup.prepared.translation,
+                                        );
                                         failures.push(format!("Saved translation: {error}"))
                                     }
                                 }
@@ -407,18 +456,37 @@ impl App {
                             if let Some(result) = startup.ime {
                                 match result {
                                     Ok(package) => self.accept_ime(*package),
-                                    Err(error) => failures.push(format!("Saved IME: {error}")),
+                                    Err(error) => {
+                                        invalidated |= self.forget_stale_prepared(
+                                            PackageTab::Ime,
+                                            &startup.prepared.ime,
+                                        );
+                                        failures.push(format!("Saved IME: {error}"));
+                                    }
                                 }
                             }
                             if let Some(result) = startup.performance {
                                 match result {
                                     Ok(package) => self.accept_performance(*package),
                                     Err(error) => {
+                                        invalidated |= self.forget_stale_prepared(
+                                            PackageTab::Performance,
+                                            &startup.prepared.performance,
+                                        );
                                         failures.push(format!("Saved performance package: {error}"))
                                     }
                                 }
                             }
+                            if invalidated {
+                                self.persist();
+                                if self.error
+                                    && self.status.starts_with("Could not save settings: ")
+                                {
+                                    failures.push(self.status.clone());
+                                }
+                            }
                             self.error = !failures.is_empty();
+                            self.status_parts = failures.clone();
                             self.status = if failures.is_empty() {
                                 "Ready".into()
                             } else {
@@ -441,6 +509,34 @@ impl App {
                         Ok(Work::PerformancePackage(package)) => {
                             self.accept_performance(*package);
                             self.status = "Performance package ready".into();
+                        }
+                        Ok(Work::DownloadsCleared(result)) => {
+                            // A partial clear may invalidate any cached package. Drop
+                            // all prepared paths even when the backend reports an error.
+                            self.selected = None;
+                            self.ime_selected = None;
+                            self.performance_selected = None;
+                            self.settings.prepared_translation.clear();
+                            self.settings.prepared_ime.clear();
+                            self.settings.prepared_performance.clear();
+                            self.error = result.is_err();
+                            self.status = match result {
+                                Ok(()) => "Downloads cleared".into(),
+                                Err(error) => format!("Could not clear downloads: {error}"),
+                            };
+                            self.persist();
+                        }
+                        Ok(Work::Launch(result)) => {
+                            self.status = if result.game_pid.is_some() {
+                                "Game started"
+                            } else {
+                                "Launch requested"
+                            }
+                            .into();
+                            self.status_parts = vec![
+                                result.status,
+                                format!("Launch log: {}", result.log.display()),
+                            ];
                         }
                         Ok(Work::Message(message)) => self.status = message,
                         Err(error) => {
@@ -512,7 +608,6 @@ impl App {
     fn launch_options(&self) -> launch::Options {
         launch::Options {
             game_root: PathBuf::from(&self.settings.game_folder),
-            tempest_cli: PathBuf::from(&self.settings.tempest_cli),
             language: self.settings.launch_language.clone(),
             homedir: self.settings.homedir.clone(),
             performance: self
@@ -527,12 +622,13 @@ impl App {
         if self.settings.performance_enabled && self.performance_selected.is_none() {
             self.error = true;
             self.status = "Download the selected performance package before launch".into();
+            self.status_parts.clear();
             return;
         }
         let options = self.launch_options();
         let logs = engine::data_dir().join("launch-logs");
         self.work(ctx, move |_| {
-            launch::start(&options, &logs).map(|result| Work::Message(result.status))
+            launch::start(&options, &logs).map(Work::Launch)
         });
     }
     fn source_url(&self) -> String {
@@ -568,6 +664,73 @@ impl App {
         self.release_index = 0;
         self.ime_index = 0;
     }
+    fn forget_stale_prepared(&mut self, tab: PackageTab, expected: &str) -> bool {
+        if expected.is_empty() {
+            return false;
+        }
+        match tab {
+            PackageTab::Translation if self.settings.prepared_translation == expected => {
+                self.settings.prepared_translation.clear();
+                if self.selected.as_ref().is_some_and(|package| {
+                    package.directory.join("bundle.json").display().to_string() == expected
+                }) {
+                    self.selected = None;
+                }
+            }
+            PackageTab::Ime if self.settings.prepared_ime == expected => {
+                self.settings.prepared_ime.clear();
+                if self.ime_selected.as_ref().is_some_and(|package| {
+                    package
+                        .directory
+                        .join("ime-package.json")
+                        .display()
+                        .to_string()
+                        == expected
+                }) {
+                    self.ime_selected = None;
+                }
+            }
+            PackageTab::Performance if self.settings.prepared_performance == expected => {
+                self.settings.prepared_performance.clear();
+                if self.performance_selected.as_ref().is_some_and(|package| {
+                    performance::manifest_path(package).display().to_string() == expected
+                }) {
+                    self.performance_selected = None;
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+    fn clear_downloads(&mut self, ctx: &egui::Context) {
+        // CPU previews and interaction fixtures never perform cache maintenance.
+        if self.preview {
+            return;
+        }
+        let directory = engine::data_dir();
+        self.work(ctx, move |_| {
+            let result = std::panic::catch_unwind(|| cache::clear_downloads(&directory))
+                .unwrap_or_else(|_| Err("Clearing downloads was interrupted".into()));
+            // Backend failures still complete this work item so receive() can
+            // invalidate every prepared selection after an attempted clear.
+            Ok(Work::DownloadsCleared(result))
+        });
+    }
+    fn clear_downloads_button(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        busy: bool,
+    ) -> egui::Response {
+        let response = ui.add_enabled(
+            !busy && self.receiver.is_none(),
+            egui::Button::new(self.settings.ui_language.text("Clear downloads")).small(),
+        );
+        if response.clicked() {
+            self.clear_downloads(ctx);
+        }
+        response
+    }
     fn tab_source(&self, tab: PackageTab) -> (String, String, String) {
         if tab == PackageTab::Performance {
             return (
@@ -596,67 +759,146 @@ impl App {
         (self.settings.repository.clone(), self.source_url(), status)
     }
     fn repository_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, busy: bool) {
+        let language = self.settings.ui_language;
         let (repository, source, status) = self.tab_source(self.tab);
-        ui.horizontal_wrapped(|ui| {
-            ui.hyperlink_to(&repository, sources::repository_url(&repository));
-            ui.label(RichText::new(status).size(12.).color(MUTED));
-            if self.tab == PackageTab::Performance {
-                ui.hyperlink_to("Release", &source);
-            } else if ui
-                .add_enabled(!busy, egui::Button::new("Refresh"))
-                .clicked()
-            {
-                self.check_updates(ctx);
-            }
-        });
-        egui::CollapsingHeader::new("Repository settings")
-            .id_salt(match self.tab {
-                PackageTab::Translation => "localization-source",
-                PackageTab::Ime => "ime-source",
-                PackageTab::Performance => "performance-source",
-            })
-            .show(ui, |ui| {
-                if self.tab == PackageTab::Performance {
-                    ui.hyperlink_to("Manifest", sources::performance_asset_url("manifest.json"));
-                } else {
-                    ui.add_enabled_ui(!busy, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("GitHub repository");
-                            let response = ui.add(
-                                egui::TextEdit::singleline(&mut self.settings.repository)
-                                    .hint_text(REPOSITORY),
-                            );
-                            if response.changed() {
-                                self.settings.catalog_url = catalog_url(&self.settings.repository);
-                                self.invalidate_catalog();
-                                self.persist();
-                            }
-                            if response.lost_focus() {
-                                self.check_updates(ctx);
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Catalog URL");
-                            let response = ui.text_edit_singleline(&mut self.settings.catalog_url);
-                            if response.changed() {
-                                self.invalidate_catalog();
-                                self.persist();
-                            }
-                            if response.lost_focus() {
-                                self.check_updates(ctx);
-                            }
-                        });
-                        ui.hyperlink_to("Catalog", source);
+        let id = ui.make_persistent_id("bottom-repository-details");
+        let mut clicked = false;
+        let mut header =
+            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
+                .show_header(ui, |ui| {
+                    clicked = ui
+                        .add(
+                            egui::Label::new(language.text("Repository settings"))
+                                .sense(egui::Sense::click()),
+                        )
+                        .clicked();
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        self.clear_downloads_button(ui, ctx, busy);
                     });
+                });
+        if clicked {
+            header.toggle();
+        }
+        header.body(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.hyperlink_to(&repository, sources::repository_url(&repository));
+                ui.label(RichText::new(language.text(&status)).size(12.).color(MUTED));
+                if self.tab == PackageTab::Performance {
+                    ui.hyperlink_to(language.text("Release"), &source);
+                } else if ui
+                    .add_enabled(!busy, egui::Button::new(language.text("Refresh")))
+                    .clicked()
+                {
+                    self.check_updates(ctx);
                 }
             });
+            if self.tab == PackageTab::Performance {
+                ui.hyperlink_to(
+                    language.text("Manifest"),
+                    sources::performance_asset_url("manifest.json"),
+                );
+            } else {
+                ui.add_enabled_ui(!busy, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(language.text("GitHub repository"));
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut self.settings.repository)
+                                .hint_text(REPOSITORY),
+                        );
+                        if response.changed() {
+                            self.settings.catalog_url = catalog_url(&self.settings.repository);
+                            self.invalidate_catalog();
+                            self.persist();
+                        }
+                        if response.lost_focus() {
+                            self.check_updates(ctx);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(language.text("Catalog URL"));
+                        let response = ui.text_edit_singleline(&mut self.settings.catalog_url);
+                        if response.changed() {
+                            self.invalidate_catalog();
+                            self.persist();
+                        }
+                        if response.lost_focus() {
+                            self.check_updates(ctx);
+                        }
+                    });
+                    ui.hyperlink_to(language.text("Catalog"), source);
+                });
+            }
+            ui.separator();
+            ui.label(
+                RichText::new(language.text("Details"))
+                    .size(12.)
+                    .color(MUTED),
+            );
+            ui.label(language.text(&self.status));
+            if !self.status_parts.is_empty() {
+                ui.label(self.presented_status(language));
+            }
+        });
     }
     fn korean_ime_available(&self) -> bool {
         self.language.eq_ignore_ascii_case("KOR")
     }
+    fn game_language_choices(&self) -> Vec<String> {
+        let mut languages = vec!["INT".to_owned(), "KOR".to_owned()];
+        if !self.settings.launch_language.is_empty()
+            && !languages.contains(&self.settings.launch_language)
+        {
+            languages.push(self.settings.launch_language.clone());
+        }
+        languages
+    }
+    fn game_language_caption(&self, code: &str) -> String {
+        let language = self.settings.ui_language;
+        match code {
+            "INT" => format!("{} (INT)", language.text("English")),
+            "KOR" => format!("{} (KOR)", language.text("Korean")),
+            _ => code.into(),
+        }
+    }
     fn reconcile_navigation(&mut self) {
         if self.tab == PackageTab::Ime && !self.korean_ime_available() {
             self.tab = PackageTab::Translation;
+        }
+    }
+    fn presented_status(&self, language: UiLanguage) -> String {
+        if self.status_parts.is_empty() {
+            language.text(&self.status)
+        } else {
+            self.status_parts
+                .iter()
+                .map(|part| language.text(part))
+                .collect::<Vec<_>>()
+                .join("; ")
+        }
+    }
+    // The default footer is a product surface, never a backend diagnostic sink.
+    // Every branch returns fixed, short copy; full payloads stay in opt-in details.
+    fn concise_status(&self) -> &'static str {
+        if self.error {
+            if self.status == launch::LOCALIZATION_LANGUAGE_MISMATCH {
+                return launch::LOCALIZATION_LANGUAGE_MISMATCH;
+            }
+            return "Operation failed";
+        }
+        if self.receiver.is_some() {
+            return "Working…";
+        }
+        match self.status.as_str() {
+            "Ready" => "Ready",
+            "Preparing…" => "Preparing…",
+            "Game started" => "Game started",
+            "Launch requested" => "Launch requested",
+            "Catalog refreshed" => "Refreshed",
+            "Downloads cleared" => "Downloads cleared",
+            "Package downloaded/imported and verified. Ready to apply."
+            | "IME package verified. Ready to apply."
+            | "Performance package ready" => "Package ready",
+            _ => "Done",
         }
     }
     fn render(&mut self, root_ui: &mut egui::Ui) {
@@ -673,9 +915,20 @@ impl App {
             .show(root_ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.add(egui::Image::new(&self.logo).fit_to_exact_size(egui::vec2(28., 28.)));
-                    ui.label(RichText::new("PaladinsCat Launcher").font(bold_font(20.)));
+                    ui.label(
+                        RichText::new(self.settings.ui_language.text("PaladinsCat Launcher"))
+                            .font(bold_font(20.)),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if let Some(language) = language_menu::show(ui, self.settings.ui_language) {
+                            self.settings.ui_language = language;
+                            self.persist();
+                            ctx.request_repaint();
+                        }
+                    });
                 });
             });
+        let language = self.settings.ui_language;
         egui::Panel::bottom("footer")
             .frame(egui::Frame::new().fill(BG).inner_margin(12))
             .show(root_ui, |ui| {
@@ -684,7 +937,7 @@ impl App {
                         ui.spinner();
                     }
                     ui.label(
-                        RichText::new(&self.status)
+                        RichText::new(language.text(self.concise_status()))
                             .color(if self.error {
                                 Color32::from_rgb(240, 144, 144)
                             } else {
@@ -694,179 +947,527 @@ impl App {
                     );
                 });
             });
+        egui::Panel::bottom("repository-details")
+            .frame(egui::Frame::new().fill(BG).inner_margin(12))
+            .show(root_ui, |ui| self.repository_panel(ui, ctx, busy));
         egui::CentralPanel::default().show(root_ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 card().show(ui, |ui| {
-                    ui.set_min_width(ui.available_width()); ui.label(RichText::new("Game installation").font(bold_font(16.)));
-                    ui.add_enabled_ui(!busy, |ui| { ui.horizontal(|ui| {
-                        let response = ui.add_sized([ui.available_width() - 100., 32.], egui::TextEdit::singleline(&mut self.settings.game_folder).hint_text("Select the folder containing ChaosGame"));
-                        if response.lost_focus() { self.persist(); self.refresh_installed(); }
-                        if ui.button("Browse…").clicked() && let Some(path) = rfd::FileDialog::new().pick_folder() {
-                            self.settings.game_folder = path.display().to_string(); self.persist(); self.refresh_installed();
-                        }
-                    }); });
-                    ui.label(RichText::new(format!("Installed: {}", self.installed)).size(12.).color(MUTED));
+                    ui.set_min_width(ui.available_width());
+                    ui.label(
+                        RichText::new(language.text("Game installation")).font(bold_font(16.)),
+                    );
+                    ui.add_enabled_ui(!busy, |ui| {
+                        ui.horizontal(|ui| {
+                            let response = ui.add_sized(
+                                [ui.available_width() - 100., 32.],
+                                egui::TextEdit::singleline(&mut self.settings.game_folder),
+                            );
+                            if response.lost_focus() {
+                                self.persist();
+                                self.refresh_installed();
+                            }
+                            if ui.button(language.text("Browse…")).clicked()
+                                && let Some(path) = rfd::FileDialog::new()
+                                    .set_title(language.text("Game installation"))
+                                    .pick_folder()
+                            {
+                                self.settings.game_folder = path.display().to_string();
+                                self.persist();
+                                self.refresh_installed();
+                            }
+                        });
+                    });
+                    ui.label(
+                        RichText::new(language.text(&format!("Installed: {}", self.installed)))
+                            .size(12.)
+                            .color(MUTED),
+                    );
                 });
                 ui.add_space(12.);
                 card().show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     ui.add_enabled_ui(!busy, |ui| {
+                        ui.spacing_mut().interact_size.y = 38.;
                         ui.horizontal(|ui| {
-                            ui.label("Game language");
-                            let response = ui.add(egui::TextEdit::singleline(&mut self.settings.launch_language).desired_width(55.));
-                            if response.changed() { self.persist(); }
-                            ui.label("Profile");
-                            let response = ui.add(egui::TextEdit::singleline(&mut self.settings.homedir).desired_width(150.));
-                            if response.changed() { self.persist(); }
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.add_enabled(!self.settings.game_folder.is_empty() && (!self.settings.performance_enabled || self.performance_selected.is_some()), egui::Button::new(RichText::new("Play").color(BG)).fill(ACCENT)).clicked() { self.play(ctx); }
-                            });
-                        });
-                        egui::CollapsingHeader::new("Launch settings").show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label("Tempest CLI");
-                                let response = ui.text_edit_singleline(&mut self.settings.tempest_cli);
-                                if response.changed() { self.persist(); }
-                                if ui.button("Browse…").clicked() && let Some(path) = rfd::FileDialog::new().add_filter("Tempest CLI", &["exe"]).pick_file() {
-                                    self.settings.tempest_cli = path.display().to_string(); self.persist();
-                                }
-                            });
+                            ui.label(language.text("Game language"));
+                            let choices = self.game_language_choices();
+                            let mut changed = false;
+                            egui::ComboBox::from_id_salt("game-language")
+                                .width(120.)
+                                .selected_text(
+                                    self.game_language_caption(&self.settings.launch_language),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for code in choices {
+                                        let caption = self.game_language_caption(&code);
+                                        changed |= ui
+                                            .selectable_value(
+                                                &mut self.settings.launch_language,
+                                                code,
+                                                caption,
+                                            )
+                                            .changed();
+                                    }
+                                });
+                            if changed {
+                                self.persist();
+                            }
+                            ui.label(language.text("Profile"));
+                            let response = ui.add(
+                                egui::TextEdit::singleline(&mut self.settings.homedir)
+                                    .desired_width(150.),
+                            );
+                            if response.changed() {
+                                self.persist();
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add_enabled(
+                                            !self.settings.game_folder.is_empty()
+                                                && (!self.settings.performance_enabled
+                                                    || self.performance_selected.is_some()),
+                                            egui::Button::new(
+                                                RichText::new(language.text("Play")).color(BG),
+                                            )
+                                            .fill(ACCENT),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.play(ctx);
+                                    }
+                                },
+                            );
                         });
                     });
                 });
                 ui.add_space(12.);
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.tab, PackageTab::Performance, "Performance");
-                    if ui.selectable_label(self.tab != PackageTab::Performance, "Localization").clicked() && self.tab == PackageTab::Performance {
-                        self.tab = PackageTab::Translation;
-                    }
+                ui.scope(|ui| {
+                    // Reserve the complete dropdown height before painting the
+                    // row so labels and tabs share its vertical center.
+                    ui.spacing_mut().interact_size.y = 38.;
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut self.tab,
+                            PackageTab::Performance,
+                            language.text("Performance"),
+                        );
+                        if ui
+                            .selectable_label(
+                                self.tab != PackageTab::Performance,
+                                language.text("Localization"),
+                            )
+                            .clicked()
+                            && self.tab == PackageTab::Performance
+                        {
+                            self.tab = PackageTab::Translation;
+                        }
+                        if self.tab != PackageTab::Performance {
+                            ui.add_space(12.);
+                            ui.add_enabled_ui(!busy, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(language.text("Language"));
+                                    let mut languages: Vec<_> =
+                                        self.releases.iter().map(|r| r.locale.clone()).collect();
+                                    languages.push(self.language.clone());
+                                    languages.sort();
+                                    languages.dedup();
+                                    egui::ComboBox::from_id_salt("language")
+                                        .selected_text(&self.language)
+                                        .show_ui(ui, |ui| {
+                                            for language in languages {
+                                                if ui
+                                                    .selectable_value(
+                                                        &mut self.language,
+                                                        language.clone(),
+                                                        language,
+                                                    )
+                                                    .changed()
+                                                {
+                                                    self.release_index = self
+                                                        .releases
+                                                        .iter()
+                                                        .position(|r| r.locale == self.language)
+                                                        .unwrap_or(0);
+                                                }
+                                            }
+                                        });
+                                });
+                            });
+                        }
+                    });
                 });
                 if self.tab != PackageTab::Performance {
-                    ui.add_enabled_ui(!busy, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("Language");
-                            let mut languages: Vec<_> = self.releases.iter().map(|r| r.locale.clone()).collect();
-                            languages.push(self.language.clone()); languages.sort(); languages.dedup();
-                            egui::ComboBox::from_id_salt("language").selected_text(&self.language).show_ui(ui, |ui| {
-                                for language in languages { if ui.selectable_value(&mut self.language, language.clone(), language).changed() {
-                                    self.release_index = self.releases.iter().position(|r| r.locale == self.language).unwrap_or(0);
-                                }}
-                            });
-                        });
-                    });
                     self.reconcile_navigation();
                     if self.korean_ime_available() {
                         ui.horizontal(|ui| {
                             ui.add_space(12.);
-                            ui.selectable_value(&mut self.tab, PackageTab::Translation, "Translation");
-                            ui.selectable_value(&mut self.tab, PackageTab::Ime, "Korean IME patch");
+                            ui.selectable_value(
+                                &mut self.tab,
+                                PackageTab::Translation,
+                                language.text("Translation"),
+                            );
+                            ui.selectable_value(
+                                &mut self.tab,
+                                PackageTab::Ime,
+                                language.text("Korean IME patch"),
+                            );
                         });
                     }
                 }
-                ui.add_space(6.);
-                self.repository_panel(ui, ctx, busy);
                 ui.add_space(12.);
                 if self.tab == PackageTab::Translation {
-                card().show(ui, |ui| {
-                    ui.set_min_width(ui.available_width()); ui.label(RichText::new("Translation package").font(bold_font(16.)));
-                    ui.add_enabled_ui(!busy, |ui| {
-                        ui.horizontal(|ui| {
-                            if ui.button("Import package…").clicked() && let Some(path) = rfd::FileDialog::new().add_filter("Package manifest", &["json"]).pick_file() {
-                                let cache = engine::data_dir(); self.work(ctx, move |p| engine::import(&path, &cache, p).map(|package| Work::Package(Box::new(package))));
-                            }
-                        });
-                        egui::ComboBox::from_id_salt("version").width(ui.available_width()).selected_text(self.releases.get(self.release_index)
-                            .filter(|r| r.locale == self.language).map(|r| format!("{} · {}", r.bundle_id, r.game_build))
-                            .or_else(|| self.selected.as_ref().map(|p|format!("Local · {}",p.package.bundle_id))).unwrap_or_else(|| "No published package selected".into()))
-                            .show_ui(ui, |ui| { for (i, release) in self.releases.iter().enumerate().filter(|(_, r)| r.locale == self.language) {
-                                ui.selectable_value(&mut self.release_index, i, format!("{} · {}", release.bundle_id, release.game_build));
-                            }});
-                        ui.horizontal(|ui| {
-                            let release = self.releases.get(self.release_index).filter(|r| r.locale == self.language).cloned();
-                            if ui.add_enabled(release.is_some(), egui::Button::new("Download package")).clicked() && let Some(release) = release {
-                                let cache = engine::data_dir(); self.work(ctx, move |p| engine::download(&release, &cache, p).map(|package| Work::Package(Box::new(package))));
-                            }
-                            if let Some(selected) = &self.selected { ui.label(RichText::new(format!("Prepared: {}", selected.package.bundle_id)).color(ACCENT).size(12.)); }
+                    card().show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.label(
+                            RichText::new(language.text("Translation package"))
+                                .font(bold_font(16.)),
+                        );
+                        ui.add_enabled_ui(!busy, |ui| {
+                            ui.horizontal(|ui| {
+                                if ui.button(language.text("Import package…")).clicked()
+                                    && let Some(path) = rfd::FileDialog::new()
+                                        .set_title(language.text("Import package…"))
+                                        .add_filter(language.text("Package manifest"), &["json"])
+                                        .pick_file()
+                                {
+                                    let cache = engine::data_dir();
+                                    self.work(ctx, move |p| {
+                                        engine::import(&path, &cache, p)
+                                            .map(|package| Work::Package(Box::new(package)))
+                                    });
+                                }
+                            });
+                            egui::ComboBox::from_id_salt("version")
+                                .width(ui.available_width())
+                                .selected_text(
+                                    self.releases
+                                        .get(self.release_index)
+                                        .filter(|r| r.locale == self.language)
+                                        .map(|r| format!("{} · {}", r.bundle_id, r.game_build))
+                                        .or_else(|| {
+                                            self.selected.as_ref().map(|p| {
+                                                language.text(&format!(
+                                                    "Local · {}",
+                                                    p.package.bundle_id
+                                                ))
+                                            })
+                                        })
+                                        .unwrap_or_else(|| {
+                                            language.text("No published package selected")
+                                        }),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for (i, release) in self
+                                        .releases
+                                        .iter()
+                                        .enumerate()
+                                        .filter(|(_, r)| r.locale == self.language)
+                                    {
+                                        ui.selectable_value(
+                                            &mut self.release_index,
+                                            i,
+                                            format!(
+                                                "{} · {}",
+                                                release.bundle_id, release.game_build
+                                            ),
+                                        );
+                                    }
+                                });
+                            ui.horizontal(|ui| {
+                                let release = self
+                                    .releases
+                                    .get(self.release_index)
+                                    .filter(|r| r.locale == self.language)
+                                    .cloned();
+                                if ui
+                                    .add_enabled(
+                                        release.is_some(),
+                                        egui::Button::new(language.text("Download package")),
+                                    )
+                                    .clicked()
+                                    && let Some(release) = release
+                                {
+                                    let cache = engine::data_dir();
+                                    self.work(ctx, move |p| {
+                                        engine::download(&release, &cache, p)
+                                            .map(|package| Work::Package(Box::new(package)))
+                                    });
+                                }
+                                if let Some(selected) = &self.selected {
+                                    ui.label(
+                                        RichText::new(language.text(&format!(
+                                            "Prepared: {}",
+                                            selected.package.bundle_id
+                                        )))
+                                        .color(ACCENT)
+                                        .size(12.),
+                                    );
+                                }
+                            });
                         });
                     });
-                    if let Some(notes) = self.selected.as_ref().map(|p| p.package.notes.as_str()).filter(|n| !n.is_empty())
-                        .or_else(|| self.releases.get(self.release_index).map(|r| r.notes.as_str()).filter(|n|!n.is_empty())) {
-                        ui.label(RichText::new(notes).size(12.).color(MUTED));
-                    }
-                    if self.releases.is_empty() && self.selected.is_none() {
-                        ui.label(RichText::new("No localization release is published in this catalog.").size(12.).color(MUTED));
-                    }
-                });
-                ui.add_space(12.);
-                card().show(ui, |ui| {
-                    ui.set_min_width(ui.available_width());
-                    ui.label(RichText::new("Apply & recovery").font(bold_font(16.)));
-                    ui.label(RichText::new("Close Paladins before applying or restoring files.").size(12.).color(MUTED));
-                    ui.add_enabled_ui(!busy && !self.settings.game_folder.is_empty(), |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            let ready = self.selected.as_ref().is_some_and(|p| p.package.locale == self.language);
-                            if ui.add_enabled(ready, egui::Button::new(RichText::new("Apply / Update").color(BG)).fill(ACCENT)).clicked() { self.action(ctx, Action::Apply); }
-                            if ui.button("Previous version").clicked() { self.action(ctx, Action::Rollback); }
-                            if ui.button("Restore originals").clicked() { self.action(ctx, Action::Restore); }
-                            if engine::recovery_pending(&PathBuf::from(&self.settings.game_folder)) && ui.button("Recover interrupted operation").clicked() { self.action(ctx, Action::Recover); }
+                    ui.add_space(12.);
+                    card().show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.label(
+                            RichText::new(language.text("Apply & recovery")).font(bold_font(16.)),
+                        );
+                        ui.add_enabled_ui(!busy && !self.settings.game_folder.is_empty(), |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                let ready = self
+                                    .selected
+                                    .as_ref()
+                                    .is_some_and(|p| p.package.locale == self.language);
+                                if ui
+                                    .add_enabled(
+                                        ready,
+                                        egui::Button::new(
+                                            RichText::new(language.text("Apply / Update"))
+                                                .color(BG),
+                                        )
+                                        .fill(ACCENT),
+                                    )
+                                    .clicked()
+                                {
+                                    self.action(ctx, Action::Apply);
+                                }
+                                if ui.button(language.text("Previous version")).clicked() {
+                                    self.action(ctx, Action::Rollback);
+                                }
+                                if ui.button(language.text("Restore originals")).clicked() {
+                                    self.action(ctx, Action::Restore);
+                                }
+                                if engine::recovery_pending(&PathBuf::from(
+                                    &self.settings.game_folder,
+                                )) && ui
+                                    .button(language.text("Recover interrupted operation"))
+                                    .clicked()
+                                {
+                                    self.action(ctx, Action::Recover);
+                                }
+                            });
                         });
                     });
-                });
                 }
                 ui.add_space(12.);
                 if self.tab == PackageTab::Ime && self.korean_ime_available() {
-                card().show(ui, |ui| {
-                    ui.set_min_width(ui.available_width());
-                    ui.label(RichText::new("Korean IME compatibility").font(bold_font(16.)));
-                    ui.label(RichText::new(format!("Configuration: {}", self.ime_installed.label())).size(12.).color(MUTED));
-                    ui.add_enabled_ui(!busy, |ui| {
-                        egui::ComboBox::from_id_salt("ime-version").width(ui.available_width())
-                            .selected_text(self.ime_releases.get(self.ime_index).map(|r|format!("{} · {}",r.version,r.game_build))
-                                .or_else(|| self.ime_selected.as_ref().map(|c|format!("Local{} · {}",if c.package.draft {" draft"} else {""},c.package.version))).unwrap_or_else(||"No published IME package selected".into()))
-                            .show_ui(ui, |ui| { for (i,r) in self.ime_releases.iter().enumerate() { ui.selectable_value(&mut self.ime_index,i,format!("{} · {}",r.version,r.game_build)); } });
-                        ui.horizontal_wrapped(|ui| {
-                            let release = self.ime_releases.get(self.ime_index).cloned();
-                            if ui.add_enabled(release.is_some(),egui::Button::new("Download IME package")).clicked() && let Some(release)=release {
-                                let cache=engine::data_dir(); self.work(ctx,move |p|ime::download(&release,&cache,p).map(|c|Work::ImePackage(Box::new(c))));
+                    card().show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.label(
+                            RichText::new(language.text("Korean IME compatibility"))
+                                .font(bold_font(16.)),
+                        );
+                        ui.label(
+                            RichText::new(
+                                language.text(&format!(
+                                    "Configuration: {}",
+                                    self.ime_installed.label()
+                                )),
+                            )
+                            .size(12.)
+                            .color(MUTED),
+                        );
+                        ui.add_enabled_ui(!busy, |ui| {
+                            egui::ComboBox::from_id_salt("ime-version")
+                                .width(ui.available_width())
+                                .selected_text(
+                                    self.ime_releases
+                                        .get(self.ime_index)
+                                        .map(|r| format!("{} · {}", r.version, r.game_build))
+                                        .or_else(|| {
+                                            self.ime_selected.as_ref().map(|c| {
+                                                language.text(&format!(
+                                                    "Local{} · {}",
+                                                    if c.package.draft { " draft" } else { "" },
+                                                    c.package.version
+                                                ))
+                                            })
+                                        })
+                                        .unwrap_or_else(|| {
+                                            language.text("No published IME package selected")
+                                        }),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for (i, r) in self.ime_releases.iter().enumerate() {
+                                        ui.selectable_value(
+                                            &mut self.ime_index,
+                                            i,
+                                            format!("{} · {}", r.version, r.game_build),
+                                        );
+                                    }
+                                });
+                            ui.horizontal_wrapped(|ui| {
+                                let release = self.ime_releases.get(self.ime_index).cloned();
+                                if ui
+                                    .add_enabled(
+                                        release.is_some(),
+                                        egui::Button::new(language.text("Download IME package")),
+                                    )
+                                    .clicked()
+                                    && let Some(release) = release
+                                {
+                                    let cache = engine::data_dir();
+                                    self.work(ctx, move |p| {
+                                        ime::download(&release, &cache, p)
+                                            .map(|c| Work::ImePackage(Box::new(c)))
+                                    });
+                                }
+                                if ui.button(language.text("Import IME package…")).clicked()
+                                    && let Some(path) = rfd::FileDialog::new()
+                                        .set_title(language.text("Import IME package…"))
+                                        .add_filter(
+                                            language.text("IME package manifest"),
+                                            &["json"],
+                                        )
+                                        .pick_file()
+                                {
+                                    let cache = engine::data_dir();
+                                    self.work(ctx, move |_| {
+                                        ime::import(&path, &cache)
+                                            .map(|c| Work::ImePackage(Box::new(c)))
+                                    });
+                                }
+                            });
+                            if let Some(c) = &self.ime_selected {
+                                ui.label(
+                                    RichText::new(language.text(&format!(
+                                        "Prepared: {}{}",
+                                        c.package.version,
+                                        if c.package.draft {
+                                            " · local draft"
+                                        } else {
+                                            ""
+                                        }
+                                    )))
+                                    .size(12.)
+                                    .color(ACCENT),
+                                );
                             }
-                            if ui.button("Import IME package…").clicked() && let Some(path)=rfd::FileDialog::new().add_filter("IME package manifest", &["json"]).pick_file() {
-                                let cache=engine::data_dir(); self.work(ctx,move |_|ime::import(&path,&cache).map(|c|Work::ImePackage(Box::new(c))));
-                            }
+                            ui.add_enabled_ui(!self.settings.game_folder.is_empty(), |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    let recovery = !self.preview
+                                        && ime::recovery_pending(&PathBuf::from(
+                                            &self.settings.game_folder,
+                                        ));
+                                    let prepared = self.ime_selected.is_some();
+                                    let mut enabled = self.ime_installed.enabled();
+                                    let response = ui.add_enabled(
+                                        self.ime_installed.can_toggle(prepared, recovery),
+                                        egui::Checkbox::new(
+                                            &mut enabled,
+                                            language.text("Enable Korean IME fix"),
+                                        ),
+                                    );
+                                    if response.changed()
+                                        && let Some(action) = self
+                                            .ime_installed
+                                            .toggle_action(enabled, prepared, recovery)
+                                    {
+                                        self.ime_action(ctx, action);
+                                    }
+                                    if self
+                                        .ime_installed
+                                        .update_available(self.ime_selected.as_ref())
+                                        && ui
+                                            .add_enabled(
+                                                !recovery,
+                                                egui::Button::new(
+                                                    language.text("Update IME package"),
+                                                ),
+                                            )
+                                            .clicked()
+                                    {
+                                        self.ime_action(ctx, ime::Action::Apply);
+                                    }
+                                    if recovery
+                                        && ui
+                                            .button(language.text("Recover IME operation"))
+                                            .clicked()
+                                    {
+                                        self.ime_action(ctx, ime::Action::Recover);
+                                    }
+                                });
+                            });
                         });
-                        if let Some(c)=&self.ime_selected { ui.label(RichText::new(format!("Prepared: {}{}",c.package.version,if c.package.draft {" · local draft"} else {""})).size(12.).color(ACCENT)); }
-                        if self.ime_releases.is_empty() && self.ime_selected.is_none() { ui.label(RichText::new("No IME release is published in this catalog.").size(12.).color(MUTED)); }
-                        if let Some(c)=&self.ime_selected { ui.label(RichText::new(&c.package.notes).size(12.).color(MUTED)); }
-                        ui.add_enabled_ui(!self.settings.game_folder.is_empty(),|ui| { ui.horizontal_wrapped(|ui| {
-                            let recovery = !self.preview && ime::recovery_pending(&PathBuf::from(&self.settings.game_folder));
-                            let prepared = self.ime_selected.is_some();
-                            let mut enabled = self.ime_installed.enabled();
-                            let response = ui.add_enabled(self.ime_installed.can_toggle(prepared, recovery), egui::Checkbox::new(&mut enabled, "Enable Korean IME fix"));
-                            if response.changed() && let Some(action) = self.ime_installed.toggle_action(enabled, prepared, recovery) { self.ime_action(ctx, action); }
-                            if self.ime_installed.update_available(self.ime_selected.as_ref()) && ui.add_enabled(!recovery, egui::Button::new("Update IME package")).clicked() { self.ime_action(ctx, ime::Action::Apply); }
-                            if recovery && ui.button("Recover IME operation").clicked() { self.ime_action(ctx,ime::Action::Recover); }
-                        }); });
                     });
-                    ui.label(RichText::new("Close Paladins to change this setting. Play loads the enabled fix on the next launch.").size(12.).color(MUTED));
-                });
                 }
                 if self.tab == PackageTab::Performance {
                     card().show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
-                        ui.label(RichText::new("Performance mod").font(bold_font(16.)));
+                        ui.label(
+                            RichText::new(language.text("Performance mod")).font(bold_font(16.)),
+                        );
                         ui.add_enabled_ui(!busy, |ui| {
                             ui.horizontal_wrapped(|ui| {
-                                if ui.button("Download performance package").clicked() {
-                                    let cache = engine::data_dir(); self.work(ctx, move |p| performance::download(&cache, p).map(|c| Work::PerformancePackage(Box::new(c))));
+                                if ui
+                                    .button(language.text("Download performance package"))
+                                    .clicked()
+                                {
+                                    let cache = engine::data_dir();
+                                    self.work(ctx, move |p| {
+                                        performance::download(&cache, p)
+                                            .map(|c| Work::PerformancePackage(Box::new(c)))
+                                    });
                                 }
-                                if ui.button("Import performance package…").clicked() && let Some(path) = rfd::FileDialog::new().add_filter("Performance manifest", &["json"]).pick_file() {
-                                    let cache = engine::data_dir(); self.work(ctx, move |_| performance::import(&path, &cache).map(|c| Work::PerformancePackage(Box::new(c))));
+                                if ui
+                                    .button(language.text("Import performance package…"))
+                                    .clicked()
+                                    && let Some(path) = rfd::FileDialog::new()
+                                        .set_title(language.text("Import performance package…"))
+                                        .add_filter(
+                                            language.text("Performance manifest"),
+                                            &["json"],
+                                        )
+                                        .pick_file()
+                                {
+                                    let cache = engine::data_dir();
+                                    self.work(ctx, move |_| {
+                                        performance::import(&path, &cache)
+                                            .map(|c| Work::PerformancePackage(Box::new(c)))
+                                    });
                                 }
                             });
-                            if let Some(package) = &self.performance_selected { ui.label(RichText::new(format!("Prepared: v{}", package.package.version)).color(ACCENT).size(12.)); }
-                            if ui.add_enabled(self.performance_selected.is_some() || self.settings.performance_enabled, egui::Checkbox::new(&mut self.settings.performance_enabled, "Enable performance mod on next launch")).changed() { self.persist(); }
-                            if ui.add_enabled(self.settings.performance_enabled, egui::Checkbox::new(&mut self.settings.rollback_input, "Use previous input version")).changed() { self.persist(); }
+                            if let Some(package) = &self.performance_selected {
+                                ui.label(
+                                    RichText::new(
+                                        language.text(&format!(
+                                            "Prepared: v{}",
+                                            package.package.version
+                                        )),
+                                    )
+                                    .color(ACCENT)
+                                    .size(12.),
+                                );
+                            }
+                            if ui
+                                .add_enabled(
+                                    self.performance_selected.is_some()
+                                        || self.settings.performance_enabled,
+                                    egui::Checkbox::new(
+                                        &mut self.settings.performance_enabled,
+                                        language.text("Enable performance mod on next launch"),
+                                    ),
+                                )
+                                .changed()
+                            {
+                                self.persist();
+                            }
+                            if ui
+                                .add_enabled(
+                                    self.settings.performance_enabled,
+                                    egui::Checkbox::new(
+                                        &mut self.settings.rollback_input,
+                                        language.text("Use previous input version"),
+                                    ),
+                                )
+                                .changed()
+                            {
+                                self.persist();
+                            }
                         });
-                        ui.label(RichText::new("Performance gains and combined IME compatibility remain unverified.").size(12.).color(MUTED));
                     });
                 }
                 ui.add_space(12.);
@@ -883,7 +1484,7 @@ fn main() -> eframe::Result<()> {
     let args: Vec<_> = std::env::args().collect();
     if args.len() == 2 && matches!(args[1].as_str(), "--help" | "-h") {
         println!(
-            "PaladinsCat Launcher\n  --preview|--preview-ime|--preview-performance OUTPUT.png\n  --inspect-startup OUTPUT.json\nUse paladinscat-launcher-cli for explicit download, --dry-run and --launch operations."
+            "PaladinsCat Launcher\n  --preview|--preview-ime|--preview-performance OUTPUT.png\n  --preview-kor|--preview-ime-kor|--preview-performance-kor OUTPUT.png\n  --preview-language-menu|--preview-language-menu-kor OUTPUT.png\n  --inspect-startup OUTPUT.json\n  --vm-renderer-proof PROOF.json (VM-only; requires a fresh RTX 5080 host proof)\nUse paladinscat-launcher-cli for explicit download, --dry-run and --launch operations."
         );
         return Ok(());
     }
@@ -918,11 +1519,16 @@ fn main() -> eframe::Result<()> {
                 | "--preview-prepared"
                 | "--preview-ime-prepared"
                 | "--preview-performance-prepared"
+                | "--preview-kor"
+                | "--preview-ime-kor"
+                | "--preview-performance-kor"
+                | "--preview-language-menu"
+                | "--preview-language-menu-kor"
         )
     {
         preview::render(
             &PathBuf::from(&args[2]),
-            if args[1].contains("-performance") {
+            if args[1].contains("-performance") || args[1].contains("-language-menu") {
                 PackageTab::Performance
             } else if args[1].contains("-ime") {
                 PackageTab::Ime
@@ -930,30 +1536,59 @@ fn main() -> eframe::Result<()> {
                 PackageTab::Translation
             },
             args[1].ends_with("-prepared"),
+            args[1].ends_with("-kor").then_some(UiLanguage::Korean),
+            args[1].contains("-language-menu"),
         )
         .expect("Headless GUI preview");
         return Ok(());
     }
-    if args.len() != 1 {
+    let vm_proof_path = if args.len() == 3 && args[1] == "--vm-renderer-proof" {
+        Some(PathBuf::from(&args[2]))
+    } else if args.len() == 1 {
+        None
+    } else {
         return Err(eframe::Error::AppCreation(
             std::io::Error::other("Unknown launcher arguments; use --help").into(),
         ));
-    }
+    };
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/paladinscat.png"))
         .map_err(|e| eframe::Error::AppCreation(e.into()))?;
-    let (wgpu_options, selected) = graphics_device::configuration()
-        .map_err(|e| eframe::Error::AppCreation(std::io::Error::other(e).into()))?;
-    eframe::run_native(
-        "PaladinsCat Launcher",
-        eframe::NativeOptions {
-            renderer: eframe::Renderer::Wgpu,
-            wgpu_options,
+
+    if let Some(proof_path) = vm_proof_path {
+        let selected = vm_renderer::VmRenderer::preflight(&proof_path)
+            .map_err(|e| eframe::Error::AppCreation(std::io::Error::other(e).into()))?;
+        let native_options = eframe::NativeOptions {
+            renderer: eframe::Renderer::Glow,
             viewport: egui::ViewportBuilder::default()
                 .with_icon(icon)
                 .with_inner_size([880., 960.])
                 .with_min_inner_size([720., 640.]),
             ..Default::default()
-        },
+        };
+        return eframe::run_native(
+            "PaladinsCat Launcher",
+            native_options,
+            Box::new(move |cc| {
+                selected.verify_context(cc).map_err(std::io::Error::other)?;
+                Ok(Box::new(App::new(&cc.egui_ctx, false)))
+            }),
+        );
+    }
+
+    let (wgpu_options, selected) = graphics_device::configuration()
+        .map_err(|e| eframe::Error::AppCreation(std::io::Error::other(e).into()))?;
+    let native_options = eframe::NativeOptions {
+        renderer: eframe::Renderer::Wgpu,
+        wgpu_options,
+        viewport: egui::ViewportBuilder::default()
+            .with_icon(icon)
+            .with_inner_size([880., 960.])
+            .with_min_inner_size([720., 640.]),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "PaladinsCat Launcher",
+        native_options,
         Box::new(move |cc| {
             graphics_device::verify_renderer(cc, &selected).map_err(std::io::Error::other)?;
             Ok(Box::new(App::new(&cc.egui_ctx, false)))
@@ -986,6 +1621,40 @@ mod tests {
         assert_eq!(restored.homedir, "existing-profile");
         assert_eq!(restored.prepared_translation, "bundle.json");
         assert_eq!(restored.prepared_ime, "ime-package.json");
+    }
+
+    #[test]
+    fn retired_tempest_setting_preserves_existing_launch_and_package_choices() {
+        let mut legacy = serde_json::json!({
+            "game_folder": "C:/Games/팔라딘/Season 8.1",
+            "repository": "example/existing-locales",
+            "catalog_url": "https://example.invalid/existing-catalog.json",
+            "prepared_translation": "existing-translation/bundle.json",
+            "prepared_ime": "existing-ime/ime-package.json",
+            "prepared_performance": "existing-performance/performance-package.json",
+            "performance_enabled": true,
+            "rollback_input": true,
+            "launch_language": "KOR",
+            "homedir": "existing-profile",
+            "tempest_cli": "C:/Former Tempest/tempest-cli.exe"
+        });
+        let mut expected = legacy.clone();
+        expected.as_object_mut().unwrap().remove("tempest_cli");
+        expected["ui_language"] = serde_json::json!("ENG");
+        // The retired field is ignored by serde, including stale values that
+        // would otherwise cause Settings::load to discard the whole file.
+        for retired in [
+            serde_json::json!("C:/Former Tempest/tempest-cli.exe"),
+            serde_json::Value::Null,
+            serde_json::json!({ "retired": true }),
+        ] {
+            legacy["tempest_cli"] = retired;
+            let settings: Settings = serde_json::from_value(legacy.clone()).unwrap();
+            let saved = serde_json::to_value(&settings).unwrap();
+            assert_eq!(saved, expected);
+            let reloaded: Settings = serde_json::from_value(saved).unwrap();
+            assert_eq!(serde_json::to_value(&reloaded).unwrap(), expected);
+        }
     }
 
     #[test]
@@ -1287,7 +1956,7 @@ mod tests {
     }
 
     #[test]
-    fn repository_is_rendered_below_tabs_and_only_for_the_selected_feature() {
+    fn repository_details_start_hidden_at_bottom_and_remain_feature_scoped() {
         for tab in [
             PackageTab::Translation,
             PackageTab::Ime,
@@ -1303,15 +1972,691 @@ mod tests {
             } else {
                 REPOSITORY
             };
-            assert_eq!(result.matches(repository).count(), 1, "{result}");
+            assert!(!result.contains(repository), "{result}");
             assert!(
-                result.find("Performance").unwrap() < result.find(repository).unwrap(),
+                !result.contains("Connected ·") && !result.contains("Pinned release ·"),
                 "{result}"
             );
+            let (_, header) = rendered_text_positions(&mut app, &ctx)
+                .into_iter()
+                .find(|(text, _)| text == "Repository settings")
+                .unwrap();
+            assert!(header.top() > 850., "Repository header: {header:?}");
+            click_at_point(&mut app, &ctx, header.center());
+            let result = rendered_text(&mut app, &ctx);
+            assert!(result.contains(repository), "{result}");
             if tab == PackageTab::Performance {
                 assert!(!result.contains(REPOSITORY), "{result}");
                 assert!(!result.contains("no downloadable"), "{result}");
             }
+        }
+    }
+
+    fn language_menu_frame(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let mut frame = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(880., 960.),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| app.render(ui),
+        );
+        // Interaction fixtures deliberately omit a renderer.
+        frame.textures_delta.clear();
+    }
+
+    fn click_language_widget(app: &mut App, ctx: &egui::Context, id: egui::Id) {
+        let point = ctx
+            .read_response(id)
+            .expect("Language control rendered")
+            .rect
+            .center();
+        click_at_point(app, ctx, point);
+    }
+
+    fn click_at_point(app: &mut App, ctx: &egui::Context, point: egui::Pos2) {
+        language_menu_frame(
+            app,
+            ctx,
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        language_menu_frame(
+            app,
+            ctx,
+            vec![egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        language_menu_frame(app, ctx, Vec::new());
+    }
+
+    fn rendered_text_positions(app: &mut App, ctx: &egui::Context) -> Vec<(String, egui::Rect)> {
+        fn collect(shape: &egui::Shape, output: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(text) => output.push((
+                    text.galley.text().into(),
+                    egui::Rect::from_min_size(text.pos, text.galley.size()),
+                )),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, output);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut output = Vec::new();
+        for _ in 0..3 {
+            let mut frame = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(880., 960.),
+                    )),
+                    ..Default::default()
+                },
+                |ui| app.render(ui),
+            );
+            output.clear();
+            for shape in &frame.shapes {
+                collect(&shape.shape, &mut output);
+            }
+            frame.textures_delta.clear();
+        }
+        output
+    }
+
+    #[test]
+    fn localization_language_control_shares_the_tab_row_in_both_ui_languages() {
+        for language in [UiLanguage::English, UiLanguage::Korean] {
+            let ctx = egui::Context::default();
+            let mut app = App::new(&ctx, true);
+            app.settings.ui_language = language;
+            app.tab = PackageTab::Translation;
+            let positions = rendered_text_positions(&mut app, &ctx);
+            let tab = positions
+                .iter()
+                .find(|(text, _)| text == &language.text("Localization"))
+                .unwrap()
+                .1;
+            let label = positions
+                .iter()
+                .find(|(text, _)| text == &language.text("Language"))
+                .unwrap()
+                .1;
+            let selector = positions
+                .iter()
+                .find(|(text, rect)| text == "KOR" && rect.top() > 100.)
+                .unwrap()
+                .1;
+            assert!(
+                (tab.center().y - label.center().y).abs() < 2.,
+                "{tab:?} {label:?}"
+            );
+            assert!(
+                (tab.center().y - selector.center().y).abs() < 2.,
+                "{tab:?} {selector:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn game_language_dropdown_changes_only_the_game_locale_and_preserves_saved_codes() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, true);
+        app.settings.homedir = "existing-profile".into();
+        let mut expected = serde_json::to_value(&app.settings).unwrap();
+        let (_, choice) = rendered_text_positions(&mut app, &ctx)
+            .into_iter()
+            .find(|(text, _)| text == "English (INT)")
+            .unwrap();
+        click_at_point(&mut app, &ctx, choice.center());
+        let (_, korean) = rendered_text_positions(&mut app, &ctx)
+            .into_iter()
+            .find(|(text, _)| text == "Korean (KOR)")
+            .unwrap();
+        click_at_point(&mut app, &ctx, korean.center());
+        assert_eq!(app.launch_options().language, "KOR");
+        assert_eq!(app.settings.ui_language, UiLanguage::English);
+        expected["launch_language"] = serde_json::json!("KOR");
+        assert_eq!(serde_json::to_value(&app.settings).unwrap(), expected);
+        app.settings.launch_language = "FRA".into();
+        assert!(app.game_language_choices().contains(&"FRA".to_owned()));
+        assert!(rendered_text(&mut app, &ctx).contains("FRA"));
+        assert_eq!(app.launch_options().language, "FRA");
+    }
+
+    #[test]
+    fn header_language_menu_switches_ui_and_preserves_game_configuration() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, true);
+        app.settings.homedir = "existing-profile".into();
+        app.settings.launch_language = "INT".into();
+        app.settings.prepared_translation = "existing/bundle.json".into();
+        app.settings.prepared_ime = "existing/ime-package.json".into();
+        let mut expected = serde_json::to_value(&app.settings).unwrap();
+        rendered_text(&mut app, &ctx);
+        let trigger = ctx.read_response(language_menu::button_id()).unwrap().rect;
+        assert!(
+            trigger.right() > 800. && trigger.bottom() < 80.,
+            "Header control: {trigger:?}"
+        );
+        click_language_widget(&mut app, &ctx, language_menu::button_id());
+        assert!(egui::Popup::is_id_open(&ctx, language_menu::popup_id()));
+        assert!(
+            ctx.read_response(language_menu::option_id(UiLanguage::English))
+                .is_some()
+        );
+        assert!(
+            ctx.read_response(language_menu::option_id(UiLanguage::Korean))
+                .is_some()
+        );
+        click_language_widget(&mut app, &ctx, language_menu::option_id(UiLanguage::Korean));
+        assert_eq!(app.settings.ui_language, UiLanguage::Korean);
+        assert!(!egui::Popup::is_id_open(&ctx, language_menu::popup_id()));
+        let text = rendered_text(&mut app, &ctx);
+        assert!(
+            text.contains("게임 설치 경로")
+                && text.contains("성능 모드")
+                && text.contains("준비됨"),
+            "{text}"
+        );
+        expected["ui_language"] = serde_json::json!("KOR");
+        assert_eq!(serde_json::to_value(&app.settings).unwrap(), expected);
+        let reloaded: Settings = serde_json::from_value(expected).unwrap();
+        assert_eq!(reloaded.ui_language, UiLanguage::Korean);
+        assert_eq!(app.launch_options().language, "INT");
+        assert_eq!(app.launch_options().homedir, "existing-profile");
+        click_language_widget(&mut app, &ctx, language_menu::button_id());
+        click_language_widget(
+            &mut app,
+            &ctx,
+            language_menu::option_id(UiLanguage::English),
+        );
+        assert_eq!(app.settings.ui_language, UiLanguage::English);
+        assert!(rendered_text(&mut app, &ctx).contains("Game installation"));
+    }
+
+    #[test]
+    fn language_menu_dismisses_on_escape_and_outside_click() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, true);
+        rendered_text(&mut app, &ctx);
+        click_language_widget(&mut app, &ctx, language_menu::button_id());
+        language_menu_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(!egui::Popup::is_id_open(&ctx, language_menu::popup_id()));
+        click_language_widget(&mut app, &ctx, language_menu::button_id());
+        let point = egui::pos2(450., 28.);
+        language_menu_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        language_menu_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(!egui::Popup::is_id_open(&ctx, language_menu::popup_id()));
+        assert_eq!(app.settings.ui_language, UiLanguage::English);
+    }
+
+    #[test]
+    fn combined_startup_errors_switch_each_caption_without_translating_diagnostics() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, true);
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Event::Done(Ok(Work::Startup(Startup {
+                prepared: PreparedPaths::default(),
+                catalog: Err("catalog offline".into()),
+                translation: Some(Err("C:/Games/Ready/bundle.json".into())),
+                ime: Some(Err("native ABI mismatch".into())),
+                performance: None,
+            }))))
+            .unwrap();
+        app.receiver = Some(receiver);
+        app.receive();
+        let korean = app.presented_status(UiLanguage::Korean);
+        assert!(
+            korean.contains("GitHub 카탈로그:")
+                && korean.contains("저장된 번역 패키지:")
+                && korean.contains("저장된 IME 패키지:"),
+            "{korean}"
+        );
+        assert!(
+            korean.contains("C:/Games/Ready/bundle.json") && korean.contains("native ABI mismatch")
+        );
+        assert_eq!(app.presented_status(UiLanguage::English), app.status);
+        let (sender, receiver) = mpsc::channel();
+        sender.send(Event::Progress("Preparing…".into())).unwrap();
+        app.receiver = Some(receiver);
+        app.receive();
+        assert_eq!(app.presented_status(UiLanguage::Korean), "준비 중…");
+    }
+
+    #[test]
+    fn launch_footer_is_short_and_diagnostics_require_expanding_details() {
+        for language in [UiLanguage::English, UiLanguage::Korean] {
+            for observed in [true, false] {
+                let ctx = egui::Context::default();
+                let mut app = App::new(&ctx, true);
+                ctx.global_style_mut(|style| style.animation_time = 0.);
+                app.settings.ui_language = language;
+                let diagnostic = "Game dispatched (PID 63628); fresh selected game observed (PID 63628). Mod initialization is not yet verified.";
+                let (sender, receiver) = mpsc::channel();
+                sender
+                    .send(Event::Done(Ok(Work::Launch(launch::LaunchResult {
+                        launcher_pid: 63628,
+                        game_pid: observed.then_some(63628),
+                        log: PathBuf::from("C:/logs/launch.log"),
+                        status: diagnostic.into(),
+                    }))))
+                    .unwrap();
+                app.receiver = Some(receiver);
+                let expected = if observed {
+                    "Game started"
+                } else {
+                    "Launch requested"
+                };
+                let text = rendered_text(&mut app, &ctx);
+                assert!(text.contains(&language.text(expected)), "{text}");
+                assert!(
+                    !text.contains("63628") && !text.contains("initialization"),
+                    "{text}"
+                );
+                assert_eq!(app.status_parts[0], diagnostic);
+                let (_, disclosure) = rendered_text_positions(&mut app, &ctx)
+                    .into_iter()
+                    .find(|(text, _)| text == &language.text("Repository settings"))
+                    .unwrap();
+                click_at_point(&mut app, &ctx, disclosure.center());
+                let text = rendered_text(&mut app, &ctx);
+                assert!(
+                    text.contains(&language.text(diagnostic))
+                        && text.contains("C:/logs/launch.log"),
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn installed_language_mismatch_has_one_localized_action_in_the_footer() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, true);
+        app.status = launch::LOCALIZATION_LANGUAGE_MISMATCH.into();
+        app.error = true;
+        assert_eq!(app.concise_status(), launch::LOCALIZATION_LANGUAGE_MISMATCH);
+        assert!(rendered_text(&mut app, &ctx).contains(launch::LOCALIZATION_LANGUAGE_MISMATCH));
+        app.settings.ui_language = i18n::UiLanguage::Korean;
+        assert!(rendered_text(&mut app, &ctx).contains("게임 언어를 설치된 패키지에 맞추세요"));
+        app.status.push_str("; native details");
+        assert_eq!(app.concise_status(), "Operation failed");
+    }
+
+    #[test]
+    fn arbitrary_backend_errors_and_progress_never_reach_the_default_footer() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, true);
+        let payload = "native PID 98765; C:/private/path; validation and provenance details";
+        app.status = payload.into();
+        assert_eq!(app.concise_status(), "Done");
+        assert!(!rendered_text(&mut app, &ctx).contains(payload));
+        app.error = true;
+        let text = rendered_text(&mut app, &ctx);
+        assert!(text.contains("Operation failed") && !text.contains(payload));
+        app.error = false;
+        let (sender, receiver) = mpsc::channel();
+        sender.send(Event::Progress(payload.into())).unwrap();
+        app.receiver = Some(receiver);
+        let text = rendered_text(&mut app, &ctx);
+        assert!(text.contains("Working…") && !text.contains(payload));
+        assert_eq!(app.status, payload);
+    }
+
+    #[test]
+    fn clearing_downloads_invalidates_prepared_packages_even_after_a_partial_error() {
+        for language in [UiLanguage::English, UiLanguage::Korean] {
+            for failed in [false, true] {
+                let ctx = egui::Context::default();
+                ctx.global_style_mut(|style| style.animation_time = 0.);
+                let mut app = App::new(&ctx, true);
+                app.settings.ui_language = language;
+                app.settings.game_folder = "C:/Games/preserved-installation".into();
+                app.settings.launch_language = "FRA".into();
+                app.settings.homedir = "preserved-profile".into();
+                app.settings.performance_enabled = true;
+                app.settings.rollback_input = true;
+                app.settings.prepared_translation = "cache/bundles/bundle.json".into();
+                app.settings.prepared_ime = "cache/ime/ime-package.json".into();
+                app.settings.prepared_performance = "cache/performance/manifest.json".into();
+                app.installed = "KOR · installed-package".into();
+                app.ime_installed =
+                    ImeInstallState::Enabled(Box::new(ime_package("0.1.0").package));
+                app.selected = Some(Cached {
+                    package: serde_json::from_value(serde_json::json!({
+                        "version": 1,
+                        "bundle_id": "prepared-translation",
+                        "locale": "KOR",
+                        "files": []
+                    }))
+                    .unwrap(),
+                    directory: PathBuf::from("cache/bundles"),
+                });
+                app.ime_selected = Some(ime_package("0.2.0"));
+                app.performance_selected = Some(performance::Cached {
+                    package: performance::Package {
+                        schema: 1,
+                        version: "0.1.0".into(),
+                        mod_id: "prepared-performance".into(),
+                        platform: "Win64".into(),
+                        source_revision: "c".repeat(40),
+                        game_sha256: "a".repeat(64),
+                        dinput8_sha256: "b".repeat(64),
+                        user32_sha256: "d".repeat(64),
+                        performance_verified: false,
+                        compatibility_verified: false,
+                        rendering: "fixture".into(),
+                        assets: Vec::new(),
+                    },
+                    directory: PathBuf::from("cache/performance"),
+                });
+                app.accept_catalog(catalog_fixture(true, true));
+                let installed = app.installed.clone();
+                let installed_ime = app.ime_installed.label();
+                let mut expected = serde_json::to_value(&app.settings).unwrap();
+                for key in [
+                    "prepared_translation",
+                    "prepared_ime",
+                    "prepared_performance",
+                ] {
+                    expected[key] = serde_json::json!("");
+                }
+                let diagnostic = "Recycle Bin refused C:/cache/bundles (os error 5)";
+                let result = if failed {
+                    Err(diagnostic.into())
+                } else {
+                    Ok(())
+                };
+                let (sender, receiver) = mpsc::channel();
+                sender
+                    .send(Event::Done(Ok(Work::DownloadsCleared(result))))
+                    .unwrap();
+                app.receiver = Some(receiver);
+                app.receive();
+
+                assert!(app.selected.is_none());
+                assert!(app.ime_selected.is_none());
+                assert!(app.performance_selected.is_none());
+                assert_eq!(serde_json::to_value(&app.settings).unwrap(), expected);
+                assert_eq!(app.installed, installed);
+                assert_eq!(app.ime_installed.label(), installed_ime);
+                assert!(app.ime_installed.enabled());
+                assert_eq!(app.releases.len(), 1);
+                assert_eq!(app.ime_releases.len(), 1);
+                assert_eq!(app.error, failed);
+                assert!(app.receiver.is_none());
+                let concise = if failed {
+                    "Operation failed"
+                } else {
+                    "Downloads cleared"
+                };
+                assert_eq!(app.concise_status(), concise);
+                let text = rendered_text(&mut app, &ctx);
+                assert!(text.contains(&language.text(concise)), "{text}");
+                assert!(!text.contains(diagnostic), "{text}");
+                if failed {
+                    let (_, disclosure) = rendered_text_positions(&mut app, &ctx)
+                        .into_iter()
+                        .find(|(text, _)| text == &language.text("Repository settings"))
+                        .unwrap();
+                    click_at_point(&mut app, &ctx, disclosure.center());
+                    let text = rendered_text(&mut app, &ctx);
+                    assert!(text.contains(diagnostic), "{text}");
+                    assert!(
+                        text.contains(&language.text("Could not clear downloads: ")),
+                        "{text}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn clear_downloads_is_visible_at_bottom_with_repository_details_closed() {
+        for language in [UiLanguage::English, UiLanguage::Korean] {
+            for tab in [
+                PackageTab::Translation,
+                PackageTab::Ime,
+                PackageTab::Performance,
+            ] {
+                let ctx = egui::Context::default();
+                let mut app = App::new(&ctx, true);
+                app.settings.ui_language = language;
+                app.tab = tab;
+                let positions = rendered_text_positions(&mut app, &ctx);
+                let (_, button) = positions
+                    .iter()
+                    .find(|(text, _)| text == &language.text("Clear downloads"))
+                    .unwrap();
+                let (_, disclosure) = positions
+                    .iter()
+                    .find(|(text, _)| text == &language.text("Repository settings"))
+                    .unwrap();
+                assert!(
+                    (button.center().y - disclosure.center().y).abs() < 3.,
+                    "Button: {button:?}, disclosure: {disclosure:?}"
+                );
+                assert!(
+                    button.left() > disclosure.right(),
+                    "Button: {button:?}, disclosure: {disclosure:?}"
+                );
+                assert!(
+                    button.top() > 850. && button.right() > 740.,
+                    "Button: {button:?}"
+                );
+                assert!(
+                    !positions
+                        .iter()
+                        .any(|(text, _)| text == REPOSITORY || text == performance::REPOSITORY)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clear_downloads_control_is_disabled_during_other_work() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, true);
+        for busy in [false, true] {
+            let mut enabled = None;
+            let mut frame = ctx.run_ui(egui::RawInput::default(), |ui| {
+                enabled = Some(app.clear_downloads_button(ui, &ctx, busy).enabled());
+            });
+            frame.textures_delta.clear();
+            assert_eq!(enabled, Some(!busy));
+        }
+        let (_sender, receiver) = mpsc::channel();
+        app.receiver = Some(receiver);
+        let mut enabled = None;
+        let mut frame = ctx.run_ui(egui::RawInput::default(), |ui| {
+            enabled = Some(app.clear_downloads_button(ui, &ctx, false).enabled());
+        });
+        frame.textures_delta.clear();
+        assert_eq!(enabled, Some(false));
+    }
+
+    #[test]
+    fn failed_saved_package_imports_forget_only_the_matching_prepared_family() {
+        for failed_tab in [
+            PackageTab::Translation,
+            PackageTab::Ime,
+            PackageTab::Performance,
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = App::new(&ctx, true);
+            app.settings.game_folder = "C:/Games/preserved-installation".into();
+            app.settings.launch_language = "FRA".into();
+            app.settings.homedir = "preserved-profile".into();
+            app.settings.performance_enabled = true;
+            app.settings.rollback_input = true;
+            app.settings.prepared_translation = "cache/bundles/bundle.json".into();
+            let mut stale_ime = ime_package("0.1.0");
+            stale_ime.directory = PathBuf::from("cache/ime");
+            app.accept_ime(stale_ime);
+            app.settings.prepared_performance = "cache/performance/manifest.json".into();
+            let prepared = PreparedPaths {
+                translation: app.settings.prepared_translation.clone(),
+                ime: app.settings.prepared_ime.clone(),
+                performance: app.settings.prepared_performance.clone(),
+            };
+            let mut expected = serde_json::to_value(&app.settings).unwrap();
+            expected[match failed_tab {
+                PackageTab::Translation => "prepared_translation",
+                PackageTab::Ime => "prepared_ime",
+                PackageTab::Performance => "prepared_performance",
+            }] = serde_json::json!("");
+            let (sender, receiver) = mpsc::channel();
+            sender
+                .send(Event::Done(Ok(Work::Startup(Startup {
+                    prepared,
+                    catalog: Ok(catalog_fixture(true, true)),
+                    translation: (failed_tab == PackageTab::Translation)
+                        .then(|| Err("Retired translation cache".into())),
+                    ime: (failed_tab == PackageTab::Ime).then(|| Err("Retired IME cache".into())),
+                    performance: (failed_tab == PackageTab::Performance)
+                        .then(|| Err("Retired performance cache".into())),
+                }))))
+                .unwrap();
+            app.receiver = Some(receiver);
+            app.receive();
+            assert_eq!(serde_json::to_value(&app.settings).unwrap(), expected);
+            assert_eq!(app.ime_selected.is_none(), failed_tab == PackageTab::Ime);
+            assert!(app.error);
+        }
+    }
+
+    #[test]
+    fn old_startup_failure_cannot_forget_a_newer_prepared_selection() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, true);
+        let mut current = ime_package("0.2.0");
+        current.directory = PathBuf::from("cache/current-ime");
+        app.accept_ime(current);
+        let expected = serde_json::to_value(&app.settings).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Event::Done(Ok(Work::Startup(Startup {
+                prepared: PreparedPaths {
+                    ime: "cache/retired-ime/ime-package.json".into(),
+                    ..Default::default()
+                },
+                catalog: Ok(catalog_fixture(true, true)),
+                translation: None,
+                ime: Some(Err("Retired IME cache".into())),
+                performance: None,
+            }))))
+            .unwrap();
+        app.receiver = Some(receiver);
+        app.receive();
+        assert_eq!(serde_json::to_value(&app.settings).unwrap(), expected);
+        assert_eq!(app.ime_selected.as_ref().unwrap().package.version, "0.2.0");
+    }
+
+    #[test]
+    fn package_success_keeps_new_selection_when_old_cache_cleanup_fails() {
+        for language in [UiLanguage::English, UiLanguage::Korean] {
+            let ctx = egui::Context::default();
+            ctx.global_style_mut(|style| style.animation_time = 0.);
+            let mut app = App::new(&ctx, true);
+            app.settings.ui_language = language;
+            app.settings.launch_language = "INT".into();
+            app.settings.homedir = "preserved-profile".into();
+            let package = |id: &str, directory: &str| Cached {
+                package: serde_json::from_value(serde_json::json!({
+                    "version": 1,
+                    "bundle_id": id,
+                    "locale": "KOR",
+                    "files": []
+                }))
+                .unwrap(),
+                directory: PathBuf::from(directory),
+            };
+            app.accept_translation(package("old-package", "cache/old"));
+            let newer = package("verified-new-package", "cache/new");
+            let mut expected = serde_json::to_value(&app.settings).unwrap();
+            expected["prepared_translation"] =
+                serde_json::json!(newer.directory.join("bundle.json").display().to_string());
+            let warning = "Recycle Bin refused old C:/cache/bundles (os error 5)";
+            let (sender, receiver) = mpsc::channel();
+            sender
+                .send(Event::Completion(
+                    Ok(Work::Package(Box::new(newer))),
+                    Some(warning.into()),
+                ))
+                .unwrap();
+            app.receiver = Some(receiver);
+            app.receive();
+            assert_eq!(
+                app.selected.as_ref().unwrap().package.bundle_id,
+                "verified-new-package"
+            );
+            assert_eq!(serde_json::to_value(&app.settings).unwrap(), expected);
+            assert_eq!(app.concise_status(), "Package ready");
+            assert!(!app.error);
+            assert!(app.status_parts[0].contains(warning));
+            let text = rendered_text(&mut app, &ctx);
+            assert!(text.contains(&language.text("Package ready")), "{text}");
+            assert!(!text.contains(warning), "{text}");
+            let (_, disclosure) = rendered_text_positions(&mut app, &ctx)
+                .into_iter()
+                .find(|(text, _)| text == &language.text("Repository settings"))
+                .unwrap();
+            click_at_point(&mut app, &ctx, disclosure.center());
+            let text = rendered_text(&mut app, &ctx);
+            assert!(text.contains(warning), "{text}");
+            assert!(
+                text.contains(&language.text("Download cache cleanup: ")),
+                "{text}"
+            );
         }
     }
 }

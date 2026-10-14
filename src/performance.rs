@@ -488,7 +488,31 @@ fn stage(cache: &Path, package: Package, members: BTreeMap<String, Vec<u8>>) -> 
 /// Downloads only the explicitly pinned v0.1.0 public release, never a floating
 /// latest URL. Archive, manifest and outer checksums have independent pins.
 pub fn download(cache: &Path, progress: Progress<'_>) -> Result<Cached> {
+    let _lease = crate::cache::lock(cache)?;
+    let mut attempt = crate::cache::Attempt::begin(cache, &["performance"])?;
     let root = performance_cache(cache)?;
+    let existing = root.join(MANIFEST_SHA);
+    if existing.exists() {
+        plain(&existing, true)?;
+        if let Ok(package) =
+            read(&existing.join(MANIFEST), JSON_LIMIT).and_then(|bytes| parse(&bytes))
+        {
+            let cached = Cached {
+                package,
+                directory: existing,
+            };
+            if verify(&cached).is_ok() {
+                attempt.commit();
+                crate::cache::prepared_cleanup(crate::cache::retain_family(
+                    cache,
+                    "performance",
+                    &cached.directory,
+                ));
+                progress("Performance package verified and prepared; no game files changed".into());
+                return Ok(cached);
+            }
+        }
+    }
     let downloads = cache_directory(&root, "downloads")?;
     progress("Downloading pinned performance package v0.1.0…".into());
     for (name, sha, bytes) in [
@@ -517,6 +541,12 @@ pub fn download(cache: &Path, progress: Progress<'_>) -> Result<Cached> {
     }
     let members = unpack(&downloads.join(ARCHIVE), &package, &manifest)?;
     let cached = stage(&root, package, members)?;
+    attempt.commit();
+    crate::cache::prepared_cleanup(crate::cache::retain_family(
+        cache,
+        "performance",
+        &cached.directory,
+    ));
     progress("Performance package verified and prepared; no game files changed".into());
     Ok(cached)
 }
@@ -524,6 +554,8 @@ pub fn download(cache: &Path, progress: Progress<'_>) -> Result<Cached> {
 /// Imports either the release manifest beside its pinned ZIP, or a fully
 /// extracted release directory. No executable/helper is run during import.
 pub fn import(manifest: &Path, cache: &Path) -> Result<Cached> {
+    let _lease = crate::cache::lock(cache)?;
+    let mut attempt = crate::cache::Attempt::begin(cache, &["performance"])?;
     let bytes = read(manifest, JSON_LIMIT)?;
     let package = parse(&bytes)?;
     let source = manifest
@@ -545,7 +577,14 @@ pub fn import(manifest: &Path, cache: &Path) -> Result<Cached> {
         }
         members
     };
-    stage(&performance_cache(cache)?, package, members)
+    let cached = stage(&performance_cache(cache)?, package, members)?;
+    attempt.commit();
+    crate::cache::prepared_cleanup(crate::cache::retain_family(
+        cache,
+        "performance",
+        &cached.directory,
+    ));
+    Ok(cached)
 }
 
 #[cfg(test)]

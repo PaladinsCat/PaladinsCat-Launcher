@@ -1,12 +1,12 @@
-//! Explicit, finite game dispatch through the installed Tempest CLI.
+//! Explicit, finite standalone game dispatch with compatible Tempest mod metadata.
 //!
 //! Launch/profile and enabled V2-mod discovery are adapted from LowRezStudio/Tempest
 //! at efe828dd28a48c4e1861ebf25a99cc16bd4b2425:
 //! Tempest.CLI/Launcher/{LauncherCommands,LauncherUtility}.cs,
 //! Tempest.CLI/Mods/ModCommands.cs and Tempest.CLI/TempestPathUtility.cs.
 //! Upstream source: https://github.com/LowRezStudio/Tempest (GPL-3.0-or-later).
-//! This backend never launches Paladins.exe directly, changes existing mod metadata,
-//! kills an existing client, or treats CLI dispatch as proof that hooks are active.
+//! This backend never changes existing mod metadata, kills an existing client,
+//! or treats dispatch as proof that hooks are active.
 
 use crate::{engine, ime, performance, upk_patcher};
 use serde::Deserialize;
@@ -18,6 +18,10 @@ use std::{
     process::{Child, Command, Stdio},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(windows)]
+#[path = "native_launch.rs"]
+mod native;
 
 const GAME: &str = "Binaries/Win64/Paladins.exe";
 const ENGINE_CONFIGS: [&str; 2] = [
@@ -32,11 +36,11 @@ const OBSERVATION: Duration = Duration::from_secs(8);
 
 pub const DEFAULT_LANGUAGE: &str = "INT";
 pub const DEFAULT_PROFILE: &str = "PaladinsCat";
+pub const LOCALIZATION_LANGUAGE_MISMATCH: &str = "Match Game language to the installed package";
 
 #[derive(Clone, Debug)]
 pub struct Options {
     pub game_root: PathBuf,
-    pub tempest_cli: PathBuf,
     pub language: String,
     pub homedir: String,
     pub performance: Option<performance::Cached>,
@@ -49,9 +53,9 @@ pub struct Plan {
     pub game_root: PathBuf,
     pub game_executable: PathBuf,
     pub working_directory: PathBuf,
-    pub tempest_cli: PathBuf,
-    /// Verified managed payloads, including any loaded once through the registry.
+    /// Verified managed payloads and enabled compatible registry DLLs, loaded once.
     pub dlls: Vec<PathBuf>,
+    dll_hashes: Vec<String>,
     registry: Option<(PathBuf, String)>,
     engine_configs: Vec<(PathBuf, String)>,
 }
@@ -64,21 +68,14 @@ pub struct LaunchResult {
     pub status: String,
 }
 
-pub fn default_tempest_cli() -> PathBuf {
-    std::env::var_os("ProgramFiles")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"))
-        .join("Tempest Launcher/tempest-cli.exe")
-}
-
 fn error(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
 fn argument_path(path: &Path) -> engine::Result<String> {
     let value = path.to_str().ok_or("Launch paths must be Unicode")?;
-    if value.is_empty() || value.contains(',') || value.chars().any(char::is_control) {
-        return Err("Launch paths cannot contain commas or control characters".into());
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err("Launch paths cannot contain control characters".into());
     }
     // Canonical paths are retained for identity, containment and file pins. UE3
     // and the external loader receive ordinary Win32 paths, not verbatim syntax.
@@ -177,14 +174,10 @@ fn verify_state(root: &Path, locale: &str) -> engine::Result<()> {
     if receipt.version != 1
         || !receipt.applied
         || path_key(&receipt.game_root.canonicalize().map_err(error)?)? != path_key(root)?
-        || receipt.locale != locale
         || receipt.files.is_empty()
         || receipt.files.len() > MAX_MODS
     {
-        return Err(
-            "Installed localization receipt/profile requires recovery or a matching language"
-                .into(),
-        );
+        return Err("Installed localization receipt requires recovery".into());
     }
     let state = state.canonicalize().map_err(error)?;
     let mut targets = HashSet::new();
@@ -196,6 +189,9 @@ fn verify_state(root: &Path, locale: &str) -> engine::Result<()> {
         let backup = inside(&state, &file.backup)?;
         upk_patcher::require_hash(&target, &file.artifact_sha256, "installed localization")?;
         upk_patcher::require_hash(&backup, &file.stock_sha256, "localization rollback backup")?;
+    }
+    if receipt.locale != locale {
+        return Err(LOCALIZATION_LANGUAGE_MISMATCH.into());
     }
     Ok(())
 }
@@ -220,11 +216,10 @@ fn validate_profile(options: &Options) -> engine::Result<()> {
     if options.rollback_input && options.performance.is_none() {
         return Err("Input rollback requires the selected performance package".into());
     }
-    if !options.game_root.is_absolute() || !options.tempest_cli.is_absolute() {
-        return Err("Game and installed Tempest CLI paths must be absolute".into());
+    if !options.game_root.is_absolute() {
+        return Err("Game path must be absolute".into());
     }
     argument_path(&options.game_root)?;
-    argument_path(&options.tempest_cli)?;
     Ok(())
 }
 
@@ -296,25 +291,15 @@ fn plan_with(
         let sha = upk_patcher::sha256_file(&path)?;
         engine_configs.push((path, sha));
     }
-    let cli = options.tempest_cli.canonicalize().map_err(error)?;
-    if !cli.is_file()
-        || !cli
-            .file_name()
-            .and_then(|s| s.to_str())
-            .is_some_and(|s| s.eq_ignore_ascii_case("tempest-cli.exe"))
-    {
-        return Err("Select the installed tempest-cli.exe".into());
-    }
-    external_path(&cli)?;
     verify_state(&root, &options.language)?;
-    let dlls = select(options, &root)?;
+    let selected = select(options, &root)?;
     let mut unique = HashSet::new();
-    for dll in &dlls {
+    for dll in &selected {
         if !dll.is_absolute() || !dll.is_file() || !unique.insert(path_key(dll)?) {
             return Err("Selected DLL paths must be existing, absolute and unique".into());
         }
     }
-    let automatic = audit_registry(&root, &dlls)?;
+    let automatic = audit_registry(&root, &selected)?;
     let registry = if root.join(REGISTRY).exists() {
         let path = inside(&root, &root.join(REGISTRY))?;
         let sha = upk_patcher::sha256_file(&path)?;
@@ -322,38 +307,43 @@ fn plan_with(
     } else {
         None
     };
-    let explicit: Vec<_> = dlls
+    let automatic_keys = automatic
         .iter()
-        .filter(|dll| !automatic.contains(&path_key(dll).expect("DLL paths already validated")))
-        .map(|dll| external_path(dll))
-        .collect::<engine::Result<_>>()?;
-    let mut args = vec![
-        "launch".into(),
-        external_path(&root)?,
-        "--platform".into(),
-        "Win64".into(),
-        "--homedir".into(),
-        options.homedir.clone(),
-    ];
-    if !explicit.is_empty() {
-        args.extend(["--dll".into(), explicit.join(",")]);
+        .map(|dll| path_key(dll))
+        .collect::<engine::Result<HashSet<_>>>()?;
+    let mut dlls = selected
+        .into_iter()
+        .filter(|dll| !automatic_keys.contains(&path_key(dll).expect("selected paths validated")))
+        .collect::<Vec<_>>();
+    dlls.extend(automatic);
+    // Paths are never marshalled through a comma-delimited external CLI.
+    for dll in &dlls {
+        external_path(dll)?;
     }
-    args.extend([
-        "--".into(),
+    // Compatible registry selection is user metadata, but final dispatch must
+    // still bind every DLL to the bytes reviewed before read-only pins.
+    let dll_hashes = dlls
+        .iter()
+        .map(|dll| upk_patcher::sha256_file(dll))
+        .collect::<engine::Result<_>>()?;
+    let args = vec![
+        format!("-homedir={}", options.homedir),
         "-nosteam".into(),
         "-EACALT".into(),
         "-eac-nop-loaded".into(),
         "-COOKFORDEMO".into(),
         "-seekfreeloadingpcconsole".into(),
+        "-pid=402".into(),
+        "-replayfile=".into(),
         format!("-Language={}", options.language),
-    ]);
+    ];
     Ok(Plan {
         args,
         game_root: root,
         game_executable: executable,
         working_directory,
-        tempest_cli: cli,
         dlls,
+        dll_hashes,
         registry,
         engine_configs,
     })
@@ -443,11 +433,11 @@ fn discover(root: &Path, dir: &Path, depth: usize, dlls: &mut Vec<PathBuf>) -> e
     Ok(())
 }
 
-/// Return verified selected DLLs that Tempest will already load exactly once.
-fn audit_registry(root: &Path, selected: &[PathBuf]) -> engine::Result<HashSet<String>> {
+/// Return enabled compatible registry DLLs in registry order, once per path.
+fn audit_registry(root: &Path, selected: &[PathBuf]) -> engine::Result<Vec<PathBuf>> {
     let registry = root.join(REGISTRY);
     if !registry.exists() {
-        return Ok(HashSet::new());
+        return Ok(Vec::new());
     }
     let mods: Vec<TempestMod> = read_json(&inside(root, &registry)?)?;
     if mods.len() > MAX_MODS {
@@ -459,6 +449,7 @@ fn audit_registry(root: &Path, selected: &[PathBuf]) -> engine::Result<HashSet<S
         .collect::<engine::Result<_>>()?;
     let mut ids = HashSet::new();
     let mut automatic = HashSet::new();
+    let mut paths = Vec::new();
     let mut discovered_count = 0;
     for record in mods {
         if !record.id.is_empty() && !ids.insert(record.id.to_lowercase()) {
@@ -518,6 +509,7 @@ fn audit_registry(root: &Path, selected: &[PathBuf]) -> engine::Result<HashSet<S
         }
         let mut dlls = Vec::new();
         discover(root, &dir, 0, &mut dlls)?;
+        dlls.sort_by_cached_key(|path| path.to_string_lossy().to_lowercase());
         discovered_count += dlls.len();
         if discovered_count > MAX_DISCOVERED_DLLS {
             return Err("Tempest enabled DLL inventory exceeds count limit".into());
@@ -537,11 +529,12 @@ fn audit_registry(root: &Path, selected: &[PathBuf]) -> engine::Result<HashSet<S
                 ));
             }
             if !automatic.insert(key) {
-                return Err("Tempest would load the same DLL more than once".into());
+                return Err("Enabled registry would load the same DLL more than once".into());
             }
+            paths.push(dll);
         }
     }
-    Ok(automatic)
+    Ok(paths)
 }
 
 #[derive(Clone, Debug)]
@@ -573,10 +566,11 @@ trait Host {
 }
 struct WindowsHost;
 fn launch_command(plan: &Plan) -> engine::Result<Command> {
-    let mut command = Command::new(external_path(&plan.tempest_cli)?);
+    let mut command = Command::new(external_path(&plan.game_executable)?);
     command
         .args(&plan.args)
-        .current_dir(external_path(&plan.working_directory)?);
+        .current_dir(external_path(&plan.working_directory)?)
+        .env("OPENSSL_ia32cap", "~0x20000000");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -597,7 +591,14 @@ impl Host for WindowsHost {
         let err = out.try_clone().map_err(error)?;
         let mut command = launch_command(plan)?;
         command.stdin(Stdio::null()).stdout(out).stderr(err);
-        Ok(Box::new(command.spawn().map_err(error)?))
+        #[cfg(windows)]
+        {
+            Ok(Box::new(native::dispatch(&mut command, &plan.dlls)?))
+        }
+        #[cfg(not(windows))]
+        {
+            Err("Game launch is supported on Windows only".into())
+        }
     }
     fn pause(&self) {
         std::thread::sleep(Duration::from_millis(100));
@@ -621,7 +622,6 @@ fn ensure_idle(processes: &[GameProcess]) -> engine::Result<()> {
 
 fn pinned_handles(plan: &Plan) -> engine::Result<Vec<File>> {
     std::iter::once(&plan.game_executable)
-        .chain(std::iter::once(&plan.tempest_cli))
         .chain(plan.dlls.iter())
         .chain(plan.registry.iter().map(|(path, _)| path))
         .chain(plan.engine_configs.iter().map(|(path, _)| path))
@@ -681,30 +681,29 @@ fn start_with(
     let executable = path_key(&prepared.game_executable)?;
     loop {
         for process in host.inventory()? {
-            if process
-                .executable
-                .as_deref()
-                .map(path_key)
-                .transpose()?
-                .as_ref()
-                == Some(&executable)
+            if process.pid == launcher_pid
+                && process
+                    .executable
+                    .as_deref()
+                    .map(path_key)
+                    .transpose()?
+                    .as_ref()
+                    == Some(&executable)
             {
                 return Ok(LaunchResult {
                     launcher_pid,
                     game_pid: Some(process.pid),
                     log,
                     status: format!(
-                        "Tempest dispatched (PID {launcher_pid}); fresh selected game observed (PID {}). Mod initialization is not yet verified.",
+                        "Game dispatched (PID {launcher_pid}); fresh selected game observed (PID {}). Mod initialization is not yet verified.",
                         process.pid
                     ),
                 });
             }
         }
-        if let Some(code) = child.poll()?
-            && code != 0
-        {
+        if let Some(code) = child.poll()? {
             return Err(format!(
-                "Tempest dispatch exited with code {code}; no selected game was observed. See {}",
+                "Game dispatch exited with code {code}; no selected game was observed. See {}",
                 log.display()
             ));
         }
@@ -714,7 +713,7 @@ fn start_with(
                 game_pid: None,
                 log,
                 status: format!(
-                    "Tempest dispatched (PID {launcher_pid}); selected game startup is still unconfirmed. Mod initialization is not yet verified."
+                    "Game dispatched (PID {launcher_pid}); selected game startup is still unconfirmed. Mod initialization is not yet verified."
                 ),
             });
         }
@@ -852,13 +851,10 @@ mod tests {
                 fs::create_dir_all(path.parent().unwrap()).unwrap();
                 fs::write(path, b"[URL]\nfixture=true\n").unwrap();
             }
-            let cli = home.join("tempest-cli.exe");
-            fs::write(&cli, b"not-an-executable").unwrap();
             Self {
                 home,
                 options: Options {
                     game_root: root,
-                    tempest_cli: cli,
                     language: "KOR".into(),
                     homedir: "paladinslive".into(),
                     performance: None,
@@ -1016,7 +1012,7 @@ mod tests {
         );
         assert_eq!(
             Path::new(command.get_program()).canonicalize().unwrap(),
-            plan.tempest_cli
+            plan.game_executable
         );
         for value in std::iter::once(command.get_program())
             .chain(std::iter::once(cwd.as_os_str()))
@@ -1024,9 +1020,9 @@ mod tests {
         {
             assert!(!value.to_str().unwrap().contains(r"\\?\"));
         }
-        assert_eq!(command.get_args().next().unwrap(), "launch");
+        assert_eq!(command.get_args().next().unwrap(), "-homedir=paladinslive");
         assert_eq!(plan.engine_configs.len(), 2);
-        assert_eq!(pinned_handles(&plan).unwrap().len(), 5);
+        assert_eq!(pinned_handles(&plan).unwrap().len(), 4);
         assert_eq!(
             path_key(&f.options.game_root).unwrap(),
             path_key(&plan.game_root).unwrap()
@@ -1115,7 +1111,7 @@ mod tests {
             "unexpected native path error: {failure}"
         );
         // Required-file pins coexist with the actual native shared reader.
-        assert_eq!(pins.len(), 4);
+        assert_eq!(pins.len(), 3);
     }
 
     #[cfg(windows)]
@@ -1134,27 +1130,18 @@ mod tests {
     }
 
     #[test]
-    fn plan_preserves_profile_and_places_multiple_dlls_before_passthrough() {
+    fn standalone_plan_preserves_profile_and_separate_dll_load_order() {
         let mut f = Fixture::new();
         f.options.language = "FRA".into();
         f.options.homedir = "community-profile_2".into();
         let first = f.dll("cache/input.dll");
         let second = f.dll("cache/world.dll");
         let p = f.plan(&[first.clone(), second.clone()]).unwrap();
-        let dll = p.args.iter().position(|a| a == "--dll").unwrap();
-        let separator = p.args.iter().position(|a| a == "--").unwrap();
-        assert!(dll + 1 < separator);
-        assert_eq!(
-            p.args[dll + 1],
-            format!(
-                "{},{}",
-                argument_path(&first).unwrap(),
-                argument_path(&second).unwrap()
-            )
-        );
-        assert!(p.args.contains(&"community-profile_2".into()));
+        assert_eq!(p.dlls, [first, second]);
+        assert!(!p.args.contains(&"--dll".into()));
+        assert!(!p.args.contains(&"--".into()));
+        assert!(p.args.contains(&"-homedir=community-profile_2".into()));
         assert_eq!(p.args.last().unwrap(), "-Language=FRA");
-        assert_eq!(p.tempest_cli, f.options.tempest_cli.canonicalize().unwrap());
         assert_eq!(
             p.game_executable,
             f.options.game_root.join(GAME).canonicalize().unwrap()
@@ -1163,7 +1150,17 @@ mod tests {
     }
 
     #[test]
-    fn profile_injection_and_ambiguous_dll_paths_are_rejected() {
+    fn stock_int_plan_allows_launch_without_localization_receipt() {
+        let mut f = Fixture::new();
+        f.options.language = "INT".into();
+        let p = f.plan(&[]).unwrap();
+        assert!(p.dlls.is_empty());
+        assert_eq!(p.args.last().unwrap(), "-Language=INT");
+        assert!(!f.options.game_root.join(".watchcat-localization").exists());
+    }
+
+    #[test]
+    fn profile_injection_and_duplicate_dll_paths_are_rejected() {
         let mut f = Fixture::new();
         for locale in ["kor", "KOR -windowed", "INT\n", "KOR,"] {
             f.options.language = locale.into();
@@ -1176,7 +1173,7 @@ mod tests {
         }
         f.options.homedir = "paladinslive".into();
         let comma = f.dll("cache/comma,name.dll");
-        assert!(f.plan(&[comma]).is_err());
+        assert_eq!(f.plan(std::slice::from_ref(&comma)).unwrap().dlls, [comma]);
         let unique = f.dll("cache/unique.dll");
         assert!(f.plan(&[unique.clone(), unique]).is_err());
         f.options.rollback_input = true;
@@ -1189,8 +1186,7 @@ mod tests {
         let dll = f.receipt_ime();
         let p = f.plan(std::slice::from_ref(&dll)).unwrap();
         assert_eq!(p.dlls.as_slice(), std::slice::from_ref(&dll));
-        let i = p.args.iter().position(|a| a == "--dll").unwrap();
-        assert_eq!(p.args[i + 1], argument_path(&dll).unwrap());
+        assert!(!p.args.contains(&"--dll".into()));
         assert!(!f.options.game_root.join(REGISTRY).exists());
     }
 
@@ -1262,16 +1258,39 @@ mod tests {
     #[test]
     fn enabled_unrelated_mods_are_preserved_and_unsafe_metadata_is_refused() {
         let f = Fixture::new();
-        f.dll(".tempest/v2/mods/Independent/dlls/independent.dll");
+        let dll = f.dll(".tempest/v2/mods/Independent/dlls/independent.dll");
         let registry =
             f.registry(serde_json::json!([{"Id":"Independent","Kind":"V2","Enabled":true}]));
         let original = fs::read(&registry).unwrap();
-        assert!(f.plan(&[]).is_ok());
+        assert_eq!(f.plan(&[]).unwrap().dlls, [dll]);
         assert_eq!(fs::read(&registry).unwrap(), original);
         fs::write(&registry, b"broken-json").unwrap();
         assert!(f.plan(&[]).is_err());
         f.registry(serde_json::json!([{"Id":"../escape","Kind":"V2","Enabled":true}]));
         assert!(f.plan(&[]).unwrap_err().contains("unsafe/missing ID"));
+    }
+
+    #[test]
+    fn verified_korean_install_reports_language_selection_without_weakening_file_checks() {
+        let f = Fixture::new();
+        let receipt = f.locale_receipt();
+        let before = fs::read(&receipt).unwrap();
+        assert_eq!(
+            verify_state(&f.options.game_root, "INT").unwrap_err(),
+            LOCALIZATION_LANGUAGE_MISMATCH
+        );
+        assert!(verify_state(&f.options.game_root, "KOR").is_ok());
+        assert_eq!(fs::read(&receipt).unwrap(), before);
+        fs::write(
+            f.options.game_root.join("ChaosGame/fixture.dat"),
+            b"unexpected-change",
+        )
+        .unwrap();
+        assert!(
+            verify_state(&f.options.game_root, "INT")
+                .unwrap_err()
+                .contains("hash mismatch")
+        );
     }
 
     #[test]
@@ -1437,7 +1456,7 @@ mod tests {
             vec![],
             vec![],
             vec![GameProcess {
-                pid: 88,
+                pid: 77,
                 executable: Some(f.options.game_root.join(GAME)),
             }],
         ]);
@@ -1449,7 +1468,7 @@ mod tests {
             Duration::ZERO,
         )
         .unwrap();
-        assert_eq!(r.game_pid, Some(88));
+        assert_eq!(r.game_pid, Some(77));
         assert!(r.status.contains("not yet verified"));
     }
 
@@ -1505,5 +1524,40 @@ mod tests {
             .unwrap_err()
             .contains("exited with code 7")
         );
+    }
+
+    #[test]
+    fn automatic_dll_bytes_are_pinned_and_foreign_same_path_pid_is_not_ours() {
+        let f = Fixture::new();
+        let dll = f.dll(".tempest/v2/mods/Independent/dlls/independent.dll");
+        f.registry(serde_json::json!([{"Id":"Independent","Kind":"V2","Enabled":true}]));
+        let first = f.plan(&[]).unwrap();
+        fs::write(&dll, b"changed-before-pinning").unwrap();
+        let changed = f.plan(&[]).unwrap();
+        assert_ne!(first, changed);
+        assert_eq!(first.dlls, changed.dlls);
+        let pins = pinned_handles(&changed).unwrap();
+        #[cfg(windows)]
+        assert!(fs::write(&dll, b"change-while-pinned").is_err());
+        drop(pins);
+        let host = fake(vec![
+            vec![],
+            vec![],
+            vec![],
+            vec![GameProcess {
+                pid: 88,
+                executable: Some(f.options.game_root.join(GAME)),
+            }],
+        ]);
+        let result = start_with(
+            &f.options,
+            &f.home.join("logs"),
+            &host,
+            || f.plan(&[]),
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(result.launcher_pid, 77);
+        assert_eq!(result.game_pid, None);
     }
 }
