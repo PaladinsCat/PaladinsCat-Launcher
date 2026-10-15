@@ -124,6 +124,21 @@ fn plain(path: &Path) -> Result<()> {
     Ok(())
 }
 
+// Also used for the updater's fixed, hash-checked sibling files. No recursion,
+// shell UI or permanent-delete fallback; callers retain ownership checks.
+pub(crate) fn recycle_siblings(root: &Path, paths: &[PathBuf]) -> Result<()> {
+    for ancestor in root.ancestors().filter(|p| !p.as_os_str().is_empty()) {
+        plain(ancestor)?;
+    }
+    for path in paths {
+        if path.parent() != Some(root) || !path.is_file() {
+            return Err("Cleanup accepts only regular sibling files".into());
+        }
+        plain(path)?;
+    }
+    recycle(root, paths)
+}
+
 pub(crate) fn lock(root: &Path) -> Result<Lease> {
     for ancestor in root.ancestors().filter(|p| !p.as_os_str().is_empty()) {
         if ancestor.exists() {
@@ -432,15 +447,17 @@ fn recycle(root: &Path, paths: &[PathBuf]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     fn fixture() -> PathBuf {
         let root = std::env::temp_dir()
             .join(format!(
-                "paladinscat-cache-test-{}-{}",
+                "paladinscat-cache-test-{}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
-                    .as_nanos()
+                    .as_nanos(),
+                NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ))
             .join("cache");
         fs::create_dir_all(&root).unwrap();

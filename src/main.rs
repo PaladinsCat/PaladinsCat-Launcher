@@ -6,7 +6,9 @@ mod language_menu;
 mod preview;
 mod vm_renderer;
 use i18n::UiLanguage;
-use paladinscat_launcher::{cache, engine, ime, launch, performance, sources};
+use paladinscat_launcher::{
+    cache, engine, game_discovery, ime, launch, performance, self_update, sources,
+};
 use sources::{LOCALE_REPOSITORY as REPOSITORY, catalog_url};
 
 use egui::{Color32, FontFamily, FontId, RichText};
@@ -23,6 +25,7 @@ const PANEL: Color32 = Color32::from_rgb(32, 33, 39);
 const TEXT: Color32 = Color32::from_rgb(223, 223, 214);
 const MUTED: Color32 = Color32::from_rgb(152, 152, 159);
 const ACCENT: Color32 = Color32::from_rgb(100, 186, 177);
+const DEFAULT_WINDOW_SIZE: [f32; 2] = [880., 660.];
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Settings {
@@ -45,6 +48,8 @@ struct Settings {
     launch_language: String,
     #[serde(default = "default_homedir")]
     homedir: String,
+    #[serde(default)]
+    launch_platform: launch::LaunchPlatform,
 }
 fn default_language() -> String {
     launch::DEFAULT_LANGUAGE.into()
@@ -66,6 +71,7 @@ impl Default for Settings {
             rollback_input: false,
             launch_language: default_language(),
             homedir: default_homedir(),
+            launch_platform: launch::LaunchPlatform::default(),
         }
     }
 }
@@ -203,6 +209,8 @@ impl ImeInstallState {
 }
 struct App {
     settings: Settings,
+    discovered_games: Vec<game_discovery::Installation>,
+    discovery: Option<Receiver<GameDiscovery>>,
     releases: Vec<Release>,
     release_index: usize,
     language: String,
@@ -224,6 +232,30 @@ struct App {
     catalog_status: String,
     catalog_connected: bool,
     performance_selected: Option<performance::Cached>,
+    launcher_update: LauncherUpdate,
+    update_receiver: Option<Receiver<UpdateEvent>>,
+    update_frames: u8,
+    update_notice: Option<String>,
+}
+
+enum LauncherUpdate {
+    Idle,
+    Checking,
+    Checked(self_update::Check),
+    Downloading(u8),
+    Restarting,
+    Failed(String),
+}
+enum UpdateEvent {
+    Checked(engine::Result<self_update::Check>),
+    Progress(u8),
+    Armed(engine::Result<()>),
+    Cleanup(engine::Result<Option<String>>),
+}
+
+struct GameDiscovery {
+    requested_folder: String,
+    installations: Vec<game_discovery::Installation>,
 }
 
 fn configure(ctx: &egui::Context) {
@@ -313,6 +345,8 @@ impl App {
         };
         let mut app = Self {
             settings,
+            discovered_games: Vec::new(),
+            discovery: None,
             releases: Vec::new(),
             release_index: 0,
             language: "KOR".into(),
@@ -343,9 +377,14 @@ impl App {
             catalog_status: "Catalog not checked".into(),
             catalog_connected: false,
             performance_selected: None,
+            launcher_update: LauncherUpdate::Idle,
+            update_receiver: None,
+            update_frames: 0,
+            update_notice: None,
         };
         if !preview {
             app.refresh_installed();
+            app.discover_games(ctx);
             app.startup(ctx);
         }
         app
@@ -362,6 +401,134 @@ impl App {
             self.error = true;
             self.status = format!("Could not save settings: {error}");
             self.status_parts.clear();
+        }
+    }
+    fn check_launcher_update(&mut self, ctx: &egui::Context) {
+        if self.preview || self.update_receiver.is_some() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.update_receiver = Some(receiver);
+        self.launcher_update = LauncherUpdate::Checking;
+        let repaint = ctx.clone();
+        thread::spawn(move || {
+            let _ = sender.send(UpdateEvent::Checked(self_update::check()));
+            repaint.request_repaint();
+        });
+    }
+    fn install_launcher_update(&mut self, ctx: &egui::Context, release: self_update::Release) {
+        if self.preview || self.receiver.is_some() || self.update_receiver.is_some() {
+            return;
+        }
+        self.persist();
+        if self.error && self.status.starts_with("Could not save settings:") {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.update_receiver = Some(receiver);
+        self.launcher_update = LauncherUpdate::Downloading(0);
+        let repaint = ctx.clone();
+        thread::spawn(move || {
+            let result = self_update::install(release, &|percent| {
+                let _ = sender.send(UpdateEvent::Progress(percent));
+                repaint.request_repaint();
+            });
+            let _ = sender.send(UpdateEvent::Armed(result));
+            repaint.request_repaint();
+        });
+    }
+    fn receive_launcher_update(&mut self, ctx: &egui::Context) {
+        let events = self
+            .update_receiver
+            .as_ref()
+            .map(|r| r.try_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for event in events {
+            match event {
+                UpdateEvent::Checked(result) => {
+                    self.update_receiver = None;
+                    self.launcher_update = match result {
+                        Ok(result) => LauncherUpdate::Checked(result),
+                        Err(error) => LauncherUpdate::Failed(error),
+                    };
+                }
+                UpdateEvent::Progress(percent) => {
+                    self.launcher_update = LauncherUpdate::Downloading(percent)
+                }
+                UpdateEvent::Armed(result) => {
+                    self.update_receiver = None;
+                    match result {
+                        Ok(()) => {
+                            self.launcher_update = LauncherUpdate::Restarting;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        Err(error) => self.launcher_update = LauncherUpdate::Failed(error),
+                    }
+                }
+                UpdateEvent::Cleanup(result) => {
+                    self.update_receiver = None;
+                    match result {
+                        Ok(Some(error)) => {
+                            self.update_notice =
+                                Some(format!("Launcher update rolled back: {error}"));
+                        }
+                        Err(error) => {
+                            self.update_notice = Some(format!("Launcher update cleanup: {error}"))
+                        }
+                        Ok(None) => {}
+                    }
+                    self.check_launcher_update(ctx);
+                }
+            }
+        }
+    }
+    fn launcher_update_control(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, busy: bool) {
+        let language = self.settings.ui_language;
+        let current = concat!("v", env!("CARGO_PKG_VERSION"));
+        let (label, tip, enabled) = match &self.launcher_update {
+            LauncherUpdate::Checked(self_update::Check::Available(release)) => (
+                language.text(&format!("Update v{}", release.version)),
+                if self.preview || std::env::args_os().len() == 1 {
+                    "Download and restart launcher"
+                } else {
+                    "Developer launch requires its original restart procedure"
+                },
+                !busy && (self.preview || std::env::args_os().len() == 1),
+            ),
+            LauncherUpdate::Downloading(percent) => (
+                format!("{} {percent}%", language.text("Updating…")),
+                "Downloading launcher update",
+                false,
+            ),
+            LauncherUpdate::Restarting => {
+                (language.text("Restarting…"), "Restarting launcher", false)
+            }
+            LauncherUpdate::Checking => (current.into(), "Checking launcher updates…", false),
+            LauncherUpdate::Checked(self_update::Check::NotPublished) => {
+                (current.into(), "No launcher release published", true)
+            }
+            LauncherUpdate::Failed(_) => (
+                language.text("Retry update"),
+                "Launcher update unavailable; see Diagnostics",
+                !busy,
+            ),
+            _ => (current.into(), "Check for launcher updates", !busy),
+        };
+        if ui
+            .add_enabled(
+                enabled && self.update_receiver.is_none(),
+                egui::Button::new(label).small(),
+            )
+            .on_hover_text(language.text(tip))
+            .clicked()
+        {
+            if let LauncherUpdate::Checked(self_update::Check::Available(release)) =
+                &self.launcher_update
+            {
+                self.install_launcher_update(ctx, release.clone());
+            } else {
+                self.check_launcher_update(ctx);
+            }
         }
     }
     fn refresh_installed(&mut self) {
@@ -404,6 +571,14 @@ impl App {
         });
     }
     fn receive(&mut self) {
+        match self.discovery.as_ref().map(|receiver| receiver.try_recv()) {
+            Some(Ok(result)) => {
+                self.discovery = None;
+                self.accept_discovery(result);
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => self.discovery = None,
+            _ => {}
+        }
         let events: Vec<_> = self
             .receiver
             .as_ref()
@@ -606,6 +781,37 @@ impl App {
             Ok(Work::Startup(Startup::load(&settings, &cache, progress)))
         });
     }
+    fn discover_games(&mut self, ctx: &egui::Context) {
+        if self.discovery.is_some() || self.preview {
+            return;
+        }
+        let requested_folder = self.settings.game_folder.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.discovery = Some(receiver);
+        let repaint = ctx.clone();
+        thread::spawn(move || {
+            let installations = game_discovery::discover();
+            let _ = sender.send(GameDiscovery {
+                requested_folder,
+                installations,
+            });
+            repaint.request_repaint();
+        });
+    }
+    fn accept_discovery(&mut self, result: GameDiscovery) {
+        // A result arriving after Browse/typing must never replace that choice.
+        if result.requested_folder == self.settings.game_folder
+            && let Some(installation) = game_discovery::automatic_selection(
+                &self.settings.game_folder,
+                &result.installations,
+            )
+        {
+            self.settings.game_folder = installation.path.display().to_string();
+            self.persist();
+            self.refresh_installed();
+        }
+        self.discovered_games = result.installations;
+    }
     fn accept_performance(&mut self, package: performance::Cached) {
         self.settings.prepared_performance =
             performance::manifest_path(&package).display().to_string();
@@ -617,6 +823,7 @@ impl App {
             game_root: PathBuf::from(&self.settings.game_folder),
             language: self.settings.launch_language.clone(),
             homedir: self.settings.homedir.clone(),
+            platform: self.settings.launch_platform,
             performance: self
                 .settings
                 .performance_enabled
@@ -863,7 +1070,11 @@ impl App {
                     ui.ctx().copy_text(log.display().to_string());
                 }
             });
-            if self.error || !self.status_parts.is_empty() {
+            if self.error
+                || self.update_notice.is_some()
+                || !self.status_parts.is_empty()
+                || matches!(self.launcher_update, LauncherUpdate::Failed(_))
+            {
                 egui::CollapsingHeader::new(language.text("Diagnostics"))
                     .id_salt("backend-diagnostics")
                     .default_open(false)
@@ -873,6 +1084,12 @@ impl App {
                                 .wrap()
                                 .selectable(true),
                         );
+                        if let LauncherUpdate::Failed(error) = &self.launcher_update {
+                            ui.add(egui::Label::new(error).wrap().selectable(true));
+                        }
+                        if let Some(notice) = &self.update_notice {
+                            ui.add(egui::Label::new(notice).wrap().selectable(true));
+                        }
                     });
             }
         });
@@ -941,8 +1158,13 @@ impl App {
     fn render(&mut self, root_ui: &mut egui::Ui) {
         let ctx = &root_ui.ctx().clone();
         self.receive();
+        self.receive_launcher_update(ctx);
         self.reconcile_navigation();
-        let busy = self.receiver.is_some();
+        let busy = self.receiver.is_some()
+            || matches!(
+                self.launcher_update,
+                LauncherUpdate::Downloading(_) | LauncherUpdate::Restarting
+            );
         egui::Panel::top("brand")
             .frame(
                 egui::Frame::new()
@@ -962,6 +1184,7 @@ impl App {
                             self.persist();
                             ctx.request_repaint();
                         }
+                        self.launcher_update_control(ui, ctx, busy);
                     });
                 });
             });
@@ -995,16 +1218,72 @@ impl App {
                         RichText::new(language.text("Game installation")).font(bold_font(16.)),
                     );
                     ui.add_enabled_ui(!busy, |ui| {
+                        ui.spacing_mut().interact_size.y = 36.;
                         ui.horizontal(|ui| {
+                            let has_detected = !self.discovered_games.is_empty();
+                            let buttons_width = 200. + if has_detected { 106. } else { 0. };
+                            let gaps = if has_detected { 3. } else { 2. };
                             let response = ui.add_sized(
-                                [ui.available_width() - 100., 32.],
+                                [
+                                    ui.available_width()
+                                        - buttons_width
+                                        - gaps * ui.spacing().item_spacing.x,
+                                    36.,
+                                ],
                                 egui::TextEdit::singleline(&mut self.settings.game_folder),
                             );
                             if response.lost_focus() {
                                 self.persist();
                                 self.refresh_installed();
                             }
-                            if ui.button(language.text("Browse…")).clicked()
+                            let detecting = self.discovery.is_some();
+                            if ui
+                                .add_enabled_ui(!detecting, |ui| {
+                                    ui.add_sized(
+                                        [100., 36.],
+                                        egui::Button::new(language.text(if detecting {
+                                            "Detecting…"
+                                        } else {
+                                            "Detect"
+                                        })),
+                                    )
+                                })
+                                .inner
+                                .clicked()
+                            {
+                                self.discover_games(ctx);
+                            }
+                            if has_detected {
+                                let mut chosen = None;
+                                egui::ComboBox::from_id_salt("detected-games")
+                                    .width(106.)
+                                    .selected_text(language.text("Detected"))
+                                    .show_ui(ui, |ui| {
+                                        for installation in &self.discovered_games {
+                                            let path = installation.path.display().to_string();
+                                            if ui
+                                                .selectable_label(
+                                                    self.settings.game_folder == path,
+                                                    format!(
+                                                        "{} · {path}",
+                                                        installation.store.label()
+                                                    ),
+                                                )
+                                                .clicked()
+                                            {
+                                                chosen = Some(path);
+                                            }
+                                        }
+                                    });
+                                if let Some(path) = chosen {
+                                    self.settings.game_folder = path;
+                                    self.persist();
+                                    self.refresh_installed();
+                                }
+                            }
+                            if ui
+                                .add_sized([100., 36.], egui::Button::new(language.text("Browse…")))
+                                .clicked()
                                 && let Some(path) = rfd::FileDialog::new()
                                     .set_title(language.text("Game installation"))
                                     .pick_folder()
@@ -1077,6 +1356,26 @@ impl App {
                                         .clicked()
                                     {
                                         self.play(ctx);
+                                    }
+                                    let mut platform_changed = false;
+                                    egui::ComboBox::from_id_salt("launch-platform")
+                                        .width(128.)
+                                        .selected_text(self.settings.launch_platform.caption())
+                                        .show_ui(ui, |ui| {
+                                            for platform in launch::LaunchPlatform::ALL {
+                                                platform_changed |= ui
+                                                    .selectable_value(
+                                                        &mut self.settings.launch_platform,
+                                                        platform,
+                                                        platform.caption(),
+                                                    )
+                                                    .changed();
+                                            }
+                                        })
+                                        .response
+                                        .on_hover_text(language.text("Launch platform"));
+                                    if platform_changed {
+                                        self.persist();
                                     }
                                 },
                             );
@@ -1533,10 +1832,34 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         self.render(ui);
+        if self.update_frames == 0 {
+            self.update_frames = 1;
+            ui.ctx().request_repaint();
+        } else if self.update_frames == 1 {
+            // The first frame has returned through eframe's rendering loop.
+            // Acknowledge only on the next UI callback, after renderer checks.
+            self.update_frames = 2;
+            let result = self_update::mark_ready();
+            if let Err(error) = result {
+                self.status_parts
+                    .push(format!("Launcher update readiness: {error}"));
+            }
+            let (sender, receiver) = mpsc::channel();
+            self.update_receiver = Some(receiver);
+            self.launcher_update = LauncherUpdate::Checking;
+            let repaint = ui.ctx().clone();
+            thread::spawn(move || {
+                let _ = sender.send(UpdateEvent::Cleanup(self_update::startup_cleanup()));
+                repaint.request_repaint();
+            });
+        }
     }
 }
 fn main() -> eframe::Result<()> {
     let args: Vec<_> = std::env::args().collect();
+    if let Some(result) = self_update::helper_mode(&args) {
+        return result.map_err(|e| eframe::Error::AppCreation(std::io::Error::other(e).into()));
+    }
     if args.len() == 2 && matches!(args[1].as_str(), "--help" | "-h") {
         println!(
             "PaladinsCat Launcher\n  --preview|--preview-ime|--preview-performance OUTPUT.png\n  --preview-kor|--preview-ime-kor|--preview-performance-kor OUTPUT.png\n  --preview-language-menu|--preview-language-menu-kor OUTPUT.png\n  --inspect-startup OUTPUT.json\n  --vm-renderer-proof PROOF.json (VM-only; requires a fresh RTX 5080 host proof)\nUse paladinscat-launcher-cli for explicit download, --dry-run and --launch operations."
@@ -1572,6 +1895,7 @@ fn main() -> eframe::Result<()> {
                 | "--preview-ime"
                 | "--preview-performance"
                 | "--preview-prepared"
+                | "--preview-prepared-kor"
                 | "--preview-ime-prepared"
                 | "--preview-performance-prepared"
                 | "--preview-kor"
@@ -1581,6 +1905,8 @@ fn main() -> eframe::Result<()> {
                 | "--preview-language-menu-kor"
                 | "--preview-details"
                 | "--preview-details-kor"
+                | "--preview-update"
+                | "--preview-update-kor"
         )
     {
         preview::render(
@@ -1588,6 +1914,7 @@ fn main() -> eframe::Result<()> {
             if args[1].contains("-performance")
                 || args[1].contains("-language-menu")
                 || args[1].contains("-details")
+                || args[1].contains("-update")
             {
                 PackageTab::Performance
             } else if args[1].contains("-ime") {
@@ -1595,10 +1922,11 @@ fn main() -> eframe::Result<()> {
             } else {
                 PackageTab::Translation
             },
-            args[1].ends_with("-prepared"),
+            args[1].contains("-prepared"),
             args[1].ends_with("-kor").then_some(UiLanguage::Korean),
             args[1].contains("-language-menu"),
             args[1].contains("-details"),
+            args[1].contains("-update"),
         )
         .expect("Headless GUI preview");
         return Ok(());
@@ -1622,7 +1950,7 @@ fn main() -> eframe::Result<()> {
             renderer: eframe::Renderer::Glow,
             viewport: egui::ViewportBuilder::default()
                 .with_icon(icon)
-                .with_inner_size([880., 960.])
+                .with_inner_size(DEFAULT_WINDOW_SIZE)
                 .with_min_inner_size([720., 640.]),
             ..Default::default()
         };
@@ -1643,7 +1971,7 @@ fn main() -> eframe::Result<()> {
         wgpu_options,
         viewport: egui::ViewportBuilder::default()
             .with_icon(icon)
-            .with_inner_size([880., 960.])
+            .with_inner_size(DEFAULT_WINDOW_SIZE)
             .with_min_inner_size([720., 640.]),
         ..Default::default()
     };
@@ -1660,6 +1988,143 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn self_update_header_stays_compact_and_never_changes_game_settings() {
+        for language in [UiLanguage::English, UiLanguage::Korean] {
+            let ctx = egui::Context::default();
+            let mut app = App::new(&ctx, true);
+            app.settings.ui_language = language;
+            let before = serde_json::to_value(&app.settings).unwrap();
+            let (sender, receiver) = mpsc::channel();
+            sender
+                .send(UpdateEvent::Checked(Ok(self_update::Check::Available(
+                    self_update::Release {
+                        version: "0.3.9".into(),
+                        sha256: "a".repeat(64),
+                        bytes: 1024,
+                    },
+                ))))
+                .unwrap();
+            app.update_receiver = Some(receiver);
+            let positions = rendered_text_positions(&mut app, &ctx);
+            let update = positions
+                .iter()
+                .find(|(t, _)| t == &language.text("Update v0.3.9"))
+                .unwrap()
+                .1;
+            let menu = positions
+                .iter()
+                .find(|(t, _)| t == language.code())
+                .unwrap()
+                .1;
+            let title = positions
+                .iter()
+                .find(|(t, _)| t == &language.text("PaladinsCat Launcher"))
+                .unwrap()
+                .1;
+            assert!(update.left() > title.right() && update.right() < menu.left());
+            assert!((update.center().y - menu.center().y).abs() < 3.);
+            assert_eq!(serde_json::to_value(&app.settings).unwrap(), before);
+            assert!(!rendered_text(&mut app, &ctx).contains(&"a".repeat(64)));
+            let (sender, receiver) = mpsc::channel();
+            sender
+                .send(UpdateEvent::Armed(Err("owned staging error".into())))
+                .unwrap();
+            app.update_receiver = Some(receiver);
+            app.receive_launcher_update(&ctx);
+            assert!(
+                matches!(&app.launcher_update,LauncherUpdate::Failed(e) if e=="owned staging error")
+            );
+            assert!(rendered_text(&mut app, &ctx).contains(&language.text("Retry update")));
+            assert!(!rendered_text(&mut app, &ctx).contains("owned staging error"));
+        }
+    }
+
+    fn discovery_fixture() -> Vec<game_discovery::Installation> {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-game-discovery-ui")
+            .join(format!(
+                "{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+        for dir in ["Binaries/Win64", "Engine", "ChaosGame"] {
+            std::fs::create_dir_all(path.join(dir)).unwrap();
+        }
+        std::fs::write(
+            path.join("Binaries/Win64/Paladins.exe"),
+            b"fixture, never executed",
+        )
+        .unwrap();
+        vec![game_discovery::Installation {
+            path,
+            store: game_discovery::Store::Steam,
+        }]
+    }
+
+    #[test]
+    fn discovered_folder_arrives_while_catalog_is_still_pending() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, true);
+        app.settings.ui_language = UiLanguage::Korean;
+        app.settings.homedir = "saved-profile".into();
+        app.settings.rollback_input = true;
+        let mut expected = serde_json::to_value(&app.settings).unwrap();
+        let installations = discovery_fixture();
+        expected["game_folder"] = serde_json::json!(installations[0].path.display().to_string());
+        let (catalog_sender, catalog_receiver) = mpsc::channel();
+        app.receiver = Some(catalog_receiver);
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(GameDiscovery {
+                requested_folder: String::new(),
+                installations,
+            })
+            .unwrap();
+        app.discovery = Some(receiver);
+        app.receive();
+        assert_eq!(serde_json::to_value(&app.settings).unwrap(), expected);
+        assert!(app.receiver.is_some());
+        assert!(app.discovery.is_none());
+        drop(catalog_sender);
+    }
+
+    #[test]
+    fn late_discovery_preserves_manual_edits_and_multiple_installs_require_choice() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, true);
+        app.settings.game_folder = "D:/new-manual-selection".into();
+        let expected = serde_json::to_value(&app.settings).unwrap();
+        app.accept_discovery(GameDiscovery {
+            requested_folder: String::new(),
+            installations: discovery_fixture(),
+        });
+        assert_eq!(serde_json::to_value(&app.settings).unwrap(), expected);
+        assert_eq!(app.discovered_games.len(), 1);
+
+        app.settings.game_folder.clear();
+        let mut installations = discovery_fixture();
+        installations.extend(discovery_fixture());
+        app.accept_discovery(GameDiscovery {
+            requested_folder: String::new(),
+            installations,
+        });
+        assert!(app.settings.game_folder.is_empty());
+        assert_eq!(app.discovered_games.len(), 2);
+        let text = rendered_text(&mut app, &ctx);
+        assert!(
+            text.contains("Detected") && text.contains("Browse…") && text.contains("Detect"),
+            "{text}"
+        );
+        app.settings.ui_language = UiLanguage::Korean;
+        let text = rendered_text(&mut app, &ctx);
+        assert!(
+            text.contains("검색 결과") && text.contains("찾아보기…") && text.contains("자동 검색"),
+            "{text}"
+        );
+    }
 
     #[test]
     fn legacy_patcher_settings_preserve_selected_packages_without_enabling_new_mods() {
@@ -1702,6 +2167,7 @@ mod tests {
         let mut expected = legacy.clone();
         expected.as_object_mut().unwrap().remove("tempest_cli");
         expected["ui_language"] = serde_json::json!("ENG");
+        expected["launch_platform"] = serde_json::json!("pc");
         // The retired field is ignored by serde, including stale values that
         // would otherwise cause Settings::load to discard the whole file.
         for retired in [
@@ -2172,6 +2638,84 @@ mod tests {
                 (tab.center().y - selector.center().y).abs() < 2.,
                 "{tab:?} {selector:?}"
             );
+        }
+    }
+
+    #[test]
+    fn saved_launch_platform_defaults_and_unknown_values_preserve_other_settings() {
+        let settings = Settings {
+            game_folder: "D:/Games/Paladins".into(),
+            homedir: "existing-profile".into(),
+            launch_language: "KOR".into(),
+            performance_enabled: true,
+            rollback_input: true,
+            ..Settings::default()
+        };
+        let expected = serde_json::to_value(&settings).unwrap();
+        for value in [
+            None,
+            Some(serde_json::json!("future-platform")),
+            Some(serde_json::json!(17)),
+        ] {
+            let mut legacy = expected.clone();
+            if let Some(value) = value {
+                legacy["launch_platform"] = value;
+            } else {
+                legacy.as_object_mut().unwrap().remove("launch_platform");
+            }
+            let restored: Settings = serde_json::from_value(legacy).unwrap();
+            assert_eq!(serde_json::to_value(restored).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn launch_platform_menu_is_beside_play_and_changes_only_the_passed_platform() {
+        for language in [UiLanguage::English, UiLanguage::Korean] {
+            let ctx = egui::Context::default();
+            ctx.global_style_mut(|style| style.animation_time = 0.);
+            let mut app = App::new(&ctx, true);
+            app.settings.ui_language = language;
+            app.settings.game_folder = "D:/Games/Paladins".into();
+            app.settings.homedir = "existing-profile".into();
+            let mut expected = serde_json::to_value(&app.settings).unwrap();
+            let positions = rendered_text_positions(&mut app, &ctx);
+            let selector = positions
+                .iter()
+                .find(|(text, _)| text == "PC (Hi-Rez)")
+                .unwrap()
+                .1;
+            let play = positions
+                .iter()
+                .find(|(text, _)| text == &language.text("Play"))
+                .unwrap()
+                .1;
+            assert!(
+                (selector.center().y - play.center().y).abs() < 2.,
+                "{selector:?} {play:?}"
+            );
+            assert!(selector.right() < play.left());
+            for (platform, serialized) in [
+                (launch::LaunchPlatform::Steam, "steam"),
+                (launch::LaunchPlatform::Epic, "epic"),
+                (launch::LaunchPlatform::Pc, "pc"),
+            ] {
+                let (_, trigger) = rendered_text_positions(&mut app, &ctx)
+                    .into_iter()
+                    .find(|(text, _)| text == app.settings.launch_platform.caption())
+                    .unwrap();
+                click_at_point(&mut app, &ctx, trigger.center());
+                let (_, choice) = rendered_text_positions(&mut app, &ctx)
+                    .into_iter()
+                    .find(|(text, _)| text == platform.caption())
+                    .unwrap();
+                click_at_point(&mut app, &ctx, choice.center());
+                assert_eq!(app.launch_options().platform, platform);
+                expected["launch_platform"] = serde_json::json!(serialized);
+                assert_eq!(serde_json::to_value(&app.settings).unwrap(), expected);
+                let restored: Settings =
+                    serde_json::from_slice(&serde_json::to_vec(&app.settings).unwrap()).unwrap();
+                assert_eq!(restored.launch_platform, platform);
+            }
         }
     }
 

@@ -1,16 +1,74 @@
 # Launcher architecture
 
+The test and release artifact is the directly runnable `paladinscat-launcher.exe`.
+Matching source and legal notices are linked from the release page. A launcher ZIP
+requiring extraction is not the product delivery format. See CONTRIBUTING.md for
+the release/version contract; release preparation emits direct EXEs with separate
+legal and source companions. Routine changes preserve
+the existing version and staging until an authorized release cutover.
+
+The native window starts at 880 × 660 logical pixels. CPU layout previews use
+that same default size. Taller tabs and expanded sections use the existing
+vertical scroll area; the window remains resizable.
+
+`self_update` checks the launcher's own GitHub stable-release API on a separate
+worker. It consumes the fixed direct EXE asset, with GitHub's SHA-256/size and a
+matching x64 PE version. A copy of the existing EXE runs the internal Windows
+helper before renderer allocation, waits for the exact original PID/creation
+time, replaces the EXE with one backup, then requires a PID/hash-bound first-frame
+acknowledgement. Failure restores the previous EXE. The normal startup worker
+clears only the transaction's owned sibling files after the helper exits.
+Settings, game data and package caches have separate ownership. See
+[self-update](self-update.md) for trust, crash recovery and verification.
+
 The GUI and installer moved from WatchCat's localization-patcher into this standalone public Rust crate. No build dependency reaches outside this repository. Native hook source stays in WatchCat. Locale authoring stays in PaladinsCat-locales; this launcher consumes its reviewed catalog and immutable release assets. Performance payloads stay in PaladinsCat-mods. The existing `%LOCALAPPDATA%/PaladinsCat/Localization` settings/cache and `.watchcat-localization` game receipts intentionally keep their names for compatibility.
 
 Windows resolves the LocalAppData known folder with package redirection disabled instead of trusting a host's environment override. `paladinscat-launcher-cli --data-dir` prints the requested location without creating files. Windows can still virtualize file operations inherited from a packaged development host; CPU checks in that host recorded the effective cache path separately. Normal unpackaged use retains the existing patcher's settings location. This lookup does not claim to escape an MSIX container.
 
 ## Launch
 
+Game-folder detection runs on a separate background worker, independently of
+GitHub/catalog availability. It reads Steam's registered client roots and
+modern/legacy `libraryfolders.vdf`, then Paladins app `444090` manifests in every
+listed library, including custom libraries on other drives. It also reads Epic's
+ProgramData `.item` install manifests and prepared Tempest instances from the
+user's `com.lowrezstudio.tempest/settings.json`. Windows known folders retain
+redirected user/shared locations. Provider records are read only, size bounded
+and ignored individually when invalid; detection never recursively scans drives.
+
+Candidates must contain `Binaries/Win64/Paladins.exe` and the `Binaries`, `Engine`
+and `ChaosGame` directories. Canonical paths deduplicate installs across providers.
+A valid saved path stays selected. An empty or missing saved path fills
+automatically when exactly one installation exists; multiple installs appear in
+the **Detected** dropdown for explicit selection. **Detect** refreshes that list;
+the editable path and **Browse** remain available for custom installs. A late
+result cannot overwrite a newer manual edit. Detect, Detected and Browse share
+the path row and a common control height. Detection does not change Play's
+existing version/fingerprint checks or install packages. The read-only CLI
+`--detect-games` prints the same candidates without saving a selection.
+
 **Play** validates the selected game, installed IME receipt, enabled performance package and native system fingerprints, then launches the Windows x64 game executable and loads the planned DLLs through this repository's Rust backend. No installed Tempest CLI is required and no console is opened. The selected profile, three-letter game locale and compatible native defaults are passed to the game. Only one performance input variant is selected. The launcher does not close an existing client.
 
 New settings and CLI operations default to language `INT` and profile `PaladinsCat`. The GUI retains explicit saved language/profile choices; changing a default never migrates existing profile files. A profile is the game's `-homedir` argument, not a localization package selector. A retired `tempest_cli` key in saved JSON is ignored; existing profile, language, prepared packages and next-launch selections remain selected.
 
 Replay libraries are profile-specific. See [replay profiles](replay-profiles.md) for storage, playback and cross-profile handling.
+
+The saved `launch_platform` dropdown beside Play selects the login method:
+**PC (Hi-Rez)** adds no platform flag, **Steam** passes `-steam`, and **Epic**
+passes `-epic`. Only the chosen platform flag enters the game's argument list;
+the old unconditional `-nosteam` is removed. Existing language, profile, native
+defaults, DLL selection and compatibility checks remain in the same launch plan.
+New and legacy settings default to PC; unsupported saved values fall back to PC
+without discarding other preferences. Install detection does not override this
+explicit login choice. The CLI exposes the same builder through
+`--login-method pc|steam|epic` on dry-run and launch operations.
+
+This follows Tempest's `InstanceWizard.svelte` / `OnboardingPage.svelte` mapping
+and `core/launch.ts` forwarding through CLI escaped arguments at revision
+`1fb304e1c2163f63b91ec51a159c8415a5aedf36`; see NOTICE.md. Here the selected flag
+passes directly to the Windows process as its own argument, without a shell or
+an installed Tempest dependency. The selection does not start a Steam/Epic
+launcher, collect credentials or assert a successful platform login.
 
 Canonical paths remain the internal identities for containment, receipts, deduplication and read-only file pins. External executable, game-root and DLL paths use ordinary Win32 drive/UNC syntax. Conversion must resolve back to the same file; unsupported device namespaces and conversions that redirect a trailing-dot/space component are refused. The game receives its `Binaries/Win64` as its working directory. The two required startup INIs are checked under the selected root, hashed, pinned and compared again before dispatch. No game configuration is rewritten. See [0.3.1 verification](verification-0.3.1.md) for the historical startup-failure evidence and transport-path boundary.
 
@@ -38,6 +96,13 @@ the GUI, package downloader and release assembler. Repository links, settings
 and publication status are in a bottom section, collapsed by default. Localization and Korean IME currently share the locale
 catalog, but each displays only its own release array. Performance uses the
 pinned mods release and never inherits a locale-catalog connection status.
+
+A saved Catalog URL overrides the repository's default rolling `main` catalog.
+A release-asset catalog URL is an intentional snapshot: Refresh reloads that
+snapshot and cannot advance it. Latest-package discovery uses the rolling catalog;
+publishing payloads alone is insufficient until `game-client/catalog.json` is
+also published on locale `main`. Verify the live rolling response after that push,
+since GitHub raw-content caches can briefly retain the preceding catalog.
 
 The game language is a dropdown, independent of the launcher and package
 languages. INT and KOR are offered; an existing saved locale code remains

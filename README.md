@@ -1,13 +1,25 @@
 # PaladinsCat Launcher
 
+[Download the launcher EXE](https://github.com/PaladinsCat/PaladinsCat-Launcher/releases/latest/download/paladinscat-launcher.exe).
+Run it directly; no extraction is required.
+
 ## Use
 
-1. Select your Paladins game folder.
+Run `paladinscat-launcher.exe` directly. The launcher is delivered as an EXE;
+no ZIP extraction is required for testing or normal use.
+
+1. The launcher detects installed games from Steam libraries, Epic Games and Tempest. If several are found, choose one under **Detected**. Use **Browse** for a custom folder; a valid saved path stays selected.
 2. Download a localization package and apply it while the game is closed.
 3. Set **Game language** to **Korean (KOR)** to match the installed Korean package.
-4. Choose any IME and performance options, then select **Play**.
+4. Choose any IME and performance options. Beside **Play**, select **PC (Hi-Rez)**, **Steam** or **Epic** for the game's login method, then select **Play**.
 
 Use the language menu at the top right to choose **ENG** or **KOR** for the launcher. This choice is saved separately from the game's language and profile.
+
+The version control beside that menu checks stable releases from this launcher's
+own GitHub repo at startup. When an update is available, select **Update** to
+download, verify and restart it. Settings and game files are preserved. The
+previous EXE is restored if startup fails, then temporary files are cleared after
+successful recovery. See [self-update](docs/self-update.md) for release requirements.
 
 Localization packages come from [PaladinsCat-locales](https://github.com/PaladinsCat/PaladinsCat-locales).
 Performance packages come from [PaladinsCat-mods](https://github.com/PaladinsCat/PaladinsCat-mods).
@@ -15,7 +27,9 @@ Use **Restore originals** to revert localization. Disable performance for the ne
 
 The launcher starts the validated Windows x64 game executable and loads enabled DLLs directly. No Tempest installation is required. Existing Tempest-compatible profile and enabled-mod settings are retained.
 
-See [version 0.3.8 verification](docs/verification-0.3.8.md) for the recorded checks and their limits.
+Local builds and check records are separate from an approved release. See
+[CONTRIBUTING.md](CONTRIBUTING.md#artifact-format-and-release-version-control)
+for EXE delivery and release version control.
 
 ## Development
 

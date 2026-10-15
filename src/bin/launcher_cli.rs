@@ -1,9 +1,25 @@
 //! Explicit CLI operations for package preparation and read-only launch checks.
-use paladinscat_launcher::{engine, graphics_policy, launch, performance};
+use paladinscat_launcher::{
+    engine, game_discovery, graphics_policy, launch, performance, self_update,
+};
 use std::path::PathBuf;
 
 fn run() -> engine::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.as_slice() == ["--check-launcher-update"] {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&self_update::check()?).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
+    if args.as_slice() == ["--detect-games"] {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&game_discovery::discover()).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
     if args.as_slice() == ["--data-dir"] {
         println!("{}", engine::data_dir().display());
         return Ok(());
@@ -37,6 +53,7 @@ fn run() -> engine::Result<()> {
             game_root: PathBuf::from(&args[1]),
             language: launch::DEFAULT_LANGUAGE.into(),
             homedir: launch::DEFAULT_PROFILE.into(),
+            platform: launch::LaunchPlatform::default(),
             performance: None,
             rollback_input: false,
         };
@@ -61,6 +78,7 @@ fn run() -> engine::Result<()> {
                 }
                 "--language" => options.language.clone_from(value),
                 "--profile" => options.homedir.clone_from(value),
+                "--login-method" => options.platform = launch::LaunchPlatform::parse(value)?,
                 _ => return Err("Unknown launcher option".into()),
             }
             index += 2;
@@ -86,7 +104,7 @@ fn run() -> engine::Result<()> {
         }
         return Ok(());
     }
-    Err("Usage: paladinscat-launcher-cli --data-dir | --pin-rtx-5080 | download-performance CACHE | --restore GAME_ROOT | --dry-run|--launch GAME_ROOT [--performance MANIFEST] [--previous-input] [--language KOR|INT] [--profile NAME]".into())
+    Err("Usage: paladinscat-launcher-cli --check-launcher-update | --detect-games | --data-dir | --pin-rtx-5080 | download-performance CACHE | --restore GAME_ROOT | --dry-run|--launch GAME_ROOT [--performance MANIFEST] [--previous-input] [--language KOR|INT] [--profile NAME] [--login-method pc|steam|epic]".into())
 }
 fn main() {
     if let Err(error) = run() {

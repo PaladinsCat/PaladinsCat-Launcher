@@ -12,11 +12,16 @@ pub fn render(
     language: Option<super::UiLanguage>,
     menu_open: bool,
     details_open: bool,
+    update_available: bool,
 ) -> Result<(), String> {
     let ctx = egui::Context::default();
     let mut app = super::App::new(&ctx, true);
     if prepared {
         app.settings = super::Settings::load();
+        app.accept_discovery(super::GameDiscovery {
+            requested_folder: app.settings.game_folder.clone(),
+            installations: super::game_discovery::discover(),
+        });
         let startup = super::Startup::load(&app.settings, &super::engine::data_dir(), &|_| {});
         let (sender, receiver) = std::sync::mpsc::channel();
         sender
@@ -30,6 +35,15 @@ pub fn render(
     }
     if menu_open {
         egui::Popup::open_id(&ctx, super::language_menu::popup_id());
+    }
+    if update_available {
+        app.launcher_update = super::LauncherUpdate::Checked(super::self_update::Check::Available(
+            super::self_update::Release {
+                version: "0.3.9".into(),
+                sha256: "a".repeat(64),
+                bytes: 1024,
+            },
+        ));
     }
     if details_open {
         app.preview_repository_open = true;
@@ -45,7 +59,7 @@ pub fn render(
         app.receiver = Some(receiver);
     }
     // Review at the initial window size, with primary package controls visible.
-    let size = [880usize, 960usize];
+    let size = super::DEFAULT_WINDOW_SIZE.map(|dimension| dimension as usize);
     let mut textures: HashMap<egui::TextureId, egui::ColorImage> = HashMap::new();
     let mut output = None;
     // Fonts/layout may request a second pass; retain texture updates across passes.

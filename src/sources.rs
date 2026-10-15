@@ -1,5 +1,9 @@
 //! Public package sources shared by download code, release tooling and feature tabs.
 
+pub const LAUNCHER_REPOSITORY: &str = "PaladinsCat/PaladinsCat-Launcher";
+pub const LAUNCHER_RELEASE_API: &str =
+    "https://api.github.com/repos/PaladinsCat/PaladinsCat-Launcher/releases/latest";
+
 pub const LOCALE_REPOSITORY: &str = "PaladinsCat/PaladinsCat-locales";
 pub const PERFORMANCE_REPOSITORY: &str = "PaladinsCat/PaladinsCat-mods";
 pub const PERFORMANCE_VERSION: &str = "0.1.0";

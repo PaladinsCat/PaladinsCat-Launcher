@@ -1,4 +1,4 @@
-//! Portable preview artifacts from an immutable public source tree; no installation.
+//! Direct EXEs and corresponding source from an immutable public source tree.
 use paladinscat_launcher::engine;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -104,8 +104,14 @@ fn source_path(path: &str) -> bool {
             | "licenses/Lucide-ISC.txt"
             | "examples/verify_icon.rs"
             | "examples/native_loader_fixture.rs"
+            | "examples/updater_fixture.rs"
+            | "examples/verify_updater.rs"
+            | "examples/verify_release.rs"
             | "docs/architecture.md"
             | "docs/package-versions.md"
+            | "docs/self-update.md"
+            | "docs/release-0.3.8.md"
+            | "docs/dependency-sources.json"
             | "docs/replay-profiles.md"
             | "docs/download-cache.md"
             | "docs/verification-0.3.6.md"
@@ -375,41 +381,7 @@ fn vendor_sources(bin: &Path, source: &BTreeMap<String, Vec<u8>>) -> Result<Vec<
 }
 
 fn binary_version(bytes: &[u8], version: &str) -> Result<()> {
-    let u32_at = |offset| {
-        bytes
-            .get(offset..offset + 4)
-            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
-    };
-    if bytes.get(..2) != Some(b"MZ") {
-        return Err("Launcher artifact is not a Windows executable".into());
-    }
-    let pe = u32_at(0x3c).ok_or("PE header absent")? as usize;
-    if bytes.get(pe..pe + 4) != Some(b"PE\0\0")
-        || bytes.get(pe + 4..pe + 6) != Some(&[0x64, 0x86])
-        || bytes.get(pe + 24..pe + 26) != Some(&[0x0b, 0x02])
-    {
-        return Err("Launcher artifact must be a Windows x64 PE32+ executable".into());
-    }
-    let parts: Vec<u16> = version
-        .split('.')
-        .map(|p| p.parse::<u16>().map_err(|e| e.to_string()))
-        .collect::<Result<_>>()?;
-    if parts.len() != 3 {
-        return Err("Launcher version must have three numeric components".into());
-    }
-    let expected = [
-        (u32::from(parts[0]) << 16) | u32::from(parts[1]),
-        u32::from(parts[2]) << 16,
-    ];
-    let matched = bytes.windows(4).enumerate().any(|(offset, bytes)| {
-        bytes == [0xbd, 0x04, 0xef, 0xfe]
-            && u32_at(offset + 8) == Some(expected[0])
-            && u32_at(offset + 12) == Some(expected[1])
-    });
-    if !matched {
-        return Err("Executable version differs from frozen source version".into());
-    }
-    Ok(())
+    paladinscat_launcher::self_update::validate_executable(bytes, version)
 }
 
 fn new_file(path: &Path) -> Result<File> {
@@ -426,6 +398,22 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
         .write_all(bytes)
         .and_then(|()| output.sync_all())
         .map_err(|e| e.to_string())
+}
+
+fn write_executables(
+    output: &Path,
+    binary_data: &BTreeMap<&str, Vec<u8>>,
+) -> Result<Vec<Artifact>> {
+    if binary_data.keys().copied().collect::<BTreeSet<_>>() != BINARIES.into_iter().collect() {
+        return Err("Release requires exactly the GUI and CLI EXEs".into());
+    }
+    let mut artifacts = Vec::new();
+    for (name, bytes) in binary_data {
+        binary_version(bytes, env!("CARGO_PKG_VERSION"))?;
+        write_new(&output.join(name), bytes)?;
+        artifacts.push(artifact(&output.join(name))?);
+    }
+    Ok(artifacts)
 }
 
 fn add_bytes<W: Write + Seek>(
@@ -523,27 +511,14 @@ fn prepare_inner(
     fs::create_dir(output).map_err(|e| format!("Release directory must be new: {e}"))?;
     let prepared = (|| -> Result<()> {
         let version = env!("CARGO_PKG_VERSION");
-        let portable_name = format!("PaladinsCat-Launcher-{version}-windows-x64-preview.zip");
         let source_name = format!("PaladinsCat-Launcher-{version}-corresponding-source.zip");
-        let readme = format!(
-            "PaladinsCat Launcher {version} preview\n\nExtract the archive and run paladinscat-launcher.exe.\nSelect your Paladins game folder. Under Localization > KOR, download and apply the translation while the game is closed.\nSet Game language to KOR, then select Play. The top-right ENG/KOR menu selects the launcher's language.\n\nGPL-3.0-or-later; see LICENSE and NOTICE.md. Corresponding source: {source_name}.\n"
-        );
-        let mut portable = ZipWriter::new(new_file(&output.join(&portable_name))?);
-        let mut portable_files = BTreeMap::new();
-        for (name, bytes) in &binary_data {
-            add_bytes(&mut portable, name, bytes, &mut portable_files)?;
-        }
+        let mut binaries = write_executables(output, &binary_data)?;
+        // Notices are separate release assets. Their basenames are unique; the
+        // corresponding source archive retains the original directory layout.
         for (from, to) in NOTICES {
-            add_bytes(&mut portable, to, &source[from], &mut portable_files)?;
+            let name = Path::new(to).file_name().ok_or("Notice filename absent")?;
+            write_new(&output.join(name), &source[from])?;
         }
-        add_bytes(
-            &mut portable,
-            "README.txt",
-            readme.as_bytes(),
-            &mut portable_files,
-        )?;
-        add_bytes(&mut portable, "catalog.json", catalog, &mut portable_files)?;
-        let portable = finish_archive(portable, &output.join(&portable_name), &portable_files)?;
         let mut archive = ZipWriter::new(new_file(&output.join(&source_name))?);
         let mut source_files = BTreeMap::new();
         for (path, bytes) in &source {
@@ -602,11 +577,12 @@ fn prepare_inner(
         write_new(&output.join("catalog.json"), catalog)?;
         let catalog_artifact = artifact(&output.join("catalog.json"))?;
         let manifest = serde_json::json!({
-            "schema_version":1,"product":"PaladinsCat Launcher","version":version,"platform":"windows-x64","channel":"preview",
+            "schema_version":2,"product":"PaladinsCat Launcher","version":version,"platform":"windows-x64",
             "source_commit":commit,"source_url":format!("https://github.com/PaladinsCat/PaladinsCat-Launcher/tree/{commit}"),
-            "portable_archive":portable,"corresponding_source":corresponding,"dependency_sources":vendor.len(),
+            "executables":binaries,"corresponding_source":corresponding,"dependency_sources":vendor.len(),
+            "self_update":{"repository":paladinscat_launcher::sources::LAUNCHER_REPOSITORY,"tag":format!("v{version}"),"asset":paladinscat_launcher::self_update::EXE,"required_github_digest":"sha256"},
             "dependencies_complete":true,"catalog":catalog_artifact,"catalog_entries":serde_json::from_slice::<serde_json::Value>(catalog).map_err(|e|e.to_string())?,
-            "portable_members":portable_files,"source_members":source_files,
+            "source_members":source_files,
             "game_files_changed":false,"gameplay_acceptance_verified":false,"visual_acceptance_verified":false,"localization_complete":false
         });
         write_new(
@@ -614,7 +590,13 @@ fn prepare_inner(
             &serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?,
         )?;
         let manifest_artifact = artifact(&output.join("release-manifest.json"))?;
-        let checksums = [portable, corresponding, catalog_artifact, manifest_artifact]
+        binaries.extend([corresponding, catalog_artifact, manifest_artifact]);
+        for (_, to) in NOTICES {
+            binaries.push(artifact(
+                &output.join(Path::new(to).file_name().ok_or("Notice filename absent")?),
+            )?);
+        }
+        let checksums = binaries
             .iter()
             .map(|item| format!("{}  {}\n", item.sha256, item.file))
             .collect::<String>();
@@ -657,6 +639,47 @@ pub fn prepare(bin: &Path, output: &Path, commit: &str, catalog: &Path) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn executable_release_assets_are_direct_pe_files_and_never_a_launcher_zip() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/release-contract-tests")
+            .join(format!(
+                "{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        fs::create_dir_all(&root).unwrap();
+        let mut bytes = vec![0; 128];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[0x3c..0x40].copy_from_slice(&64u32.to_le_bytes());
+        bytes[64..68].copy_from_slice(b"PE\0\0");
+        bytes[68..70].copy_from_slice(&[0x64, 0x86]);
+        bytes[88..90].copy_from_slice(&[0x0b, 0x02]);
+        bytes[96..100].copy_from_slice(&[0xbd, 0x04, 0xef, 0xfe]);
+        let version = env!("CARGO_PKG_VERSION")
+            .split('.')
+            .map(|p| p.parse::<u32>().unwrap())
+            .collect::<Vec<_>>();
+        bytes[104..108].copy_from_slice(&((version[0] << 16) | version[1]).to_le_bytes());
+        bytes[108..112].copy_from_slice(&(version[2] << 16).to_le_bytes());
+        let binaries = BINARIES
+            .into_iter()
+            .map(|name| (name, bytes.clone()))
+            .collect();
+        let artifacts = write_executables(&root, &binaries).unwrap();
+        assert_eq!(artifacts.len(), 2);
+        for artifact in artifacts {
+            assert!(artifact.file.ends_with(".exe"));
+            assert_eq!(fs::read(root.join(artifact.file)).unwrap(), bytes);
+            assert_eq!(artifact.sha256, sha(&bytes));
+        }
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+        assert!(write_executables(&root, &binaries).is_err());
+    }
 
     #[test]
     fn public_source_allowlist_excludes_runtime_private_helpers_and_traversal() {

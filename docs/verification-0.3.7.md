@@ -1,5 +1,10 @@
 # Launcher 0.3.7 release preparation
 
+Historical local build/package evidence. This record does not establish an
+approved release version or cutover. The user subsequently required direct EXE
+delivery; the ZIP staging described below is not the current delivery contract.
+See [release/version control](../CONTRIBUTING.md#artifact-format-and-release-version-control).
+
 Prepared as a Windows x64 preview with the published Korean v175 catalog.
 The launcher offers ENG/KOR interface language, a game-language dropdown,
 compact status copy, latest-package download retention and 다운로드 삭제.

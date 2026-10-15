@@ -10,6 +10,14 @@ Tempest is licensed under GNU GPL version 3 or, at your option, any later versio
 
 The native loading contract was also reviewed in `Tempest.CLI/inject/main.zig` at that revision. This repository's independently written Rust loader uses Unicode paths, remote owning-module RVA/image verification and bounded waits in place of the reviewed upstream ANSI path and infinite wait. No upstream C#, Zig injector source or Tempest binaries are copied or redistributed; the standalone launcher does not require a Tempest installation. The upstream copyright and GPL attribution remain retained.
 
+The login-choice pass-through contract was also reviewed at Tempest revision
+`1fb304e1c2163f63b91ec51a159c8415a5aedf36` in
+`Tempest.Launcher/src/lib/components/{library/InstanceWizard,onboarding/OnboardingPage}.svelte`,
+`Tempest.Launcher/src/lib/core/launch.ts` and
+`Tempest.CLI/Launcher/LauncherCommands.cs`. Steam adds `-steam`, Epic adds `-epic`
+and Hi-Rez adds no login flag. The dropdown, saved setting and typed Rust argument
+builder are implemented here; no upstream frontend or CLI source is redistributed.
+
 ## PaladinsCat
 
 Copyright (C) 2026 PaladinsCat contributors. Localization installer and GUI source were contributed from WatchCat. Native game-hook implementations and recordings are not included. Mod release constants and public package contracts originate in PaladinsCat-mods; its MIT notice is retained in `licenses/PaladinsCat-mods-MIT.txt`. Downloadable native binaries retain their own package license notices.

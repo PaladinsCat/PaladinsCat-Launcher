@@ -9,7 +9,7 @@
 //! or treats dispatch as proof that hooks are active.
 
 use crate::{engine, ime, performance, upk_patcher};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, Serialize};
 use std::{
     collections::HashSet,
     fs::{self, File, OpenOptions},
@@ -38,11 +38,58 @@ pub const DEFAULT_LANGUAGE: &str = "INT";
 pub const DEFAULT_PROFILE: &str = "PaladinsCat";
 pub const LOCALIZATION_LANGUAGE_MISMATCH: &str = "Match Game language to the installed package";
 
+/// Login flags match Tempest's instance wizard/onboarding pass-through contract.
+/// This is independent of the game's installation store and Win64 architecture.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LaunchPlatform {
+    #[default]
+    Pc,
+    Steam,
+    Epic,
+}
+impl LaunchPlatform {
+    pub const ALL: [Self; 3] = [Self::Pc, Self::Steam, Self::Epic];
+    pub const fn caption(self) -> &'static str {
+        match self {
+            Self::Pc => "PC (Hi-Rez)",
+            Self::Steam => "Steam",
+            Self::Epic => "Epic",
+        }
+    }
+    pub fn parse(value: &str) -> engine::Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "pc" | "hirez" => Ok(Self::Pc),
+            "steam" => Ok(Self::Steam),
+            "epic" => Ok(Self::Epic),
+            _ => Err("Launch platform must be pc, steam or epic".into()),
+        }
+    }
+    fn flag(self) -> Option<&'static str> {
+        match self {
+            Self::Pc => None,
+            Self::Steam => Some("-steam"),
+            Self::Epic => Some("-epic"),
+        }
+    }
+}
+impl<'de> Deserialize<'de> for LaunchPlatform {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        // An unsupported saved choice must not discard the rest of Settings.
+        Ok(value
+            .as_str()
+            .and_then(|s| Self::parse(s).ok())
+            .unwrap_or_default())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Options {
     pub game_root: PathBuf,
     pub language: String,
     pub homedir: String,
+    pub platform: LaunchPlatform,
     pub performance: Option<performance::Cached>,
     pub rollback_input: bool,
 }
@@ -326,9 +373,8 @@ fn plan_with(
         .iter()
         .map(|dll| upk_patcher::sha256_file(dll))
         .collect::<engine::Result<_>>()?;
-    let args = vec![
+    let mut args = vec![
         format!("-homedir={}", options.homedir),
-        "-nosteam".into(),
         "-EACALT".into(),
         "-eac-nop-loaded".into(),
         "-COOKFORDEMO".into(),
@@ -337,6 +383,9 @@ fn plan_with(
         "-replayfile=".into(),
         format!("-Language={}", options.language),
     ];
+    if let Some(flag) = options.platform.flag() {
+        args.insert(0, flag.into());
+    }
     Ok(Plan {
         args,
         game_root: root,
@@ -857,6 +906,7 @@ mod tests {
                     game_root: root,
                     language: "KOR".into(),
                     homedir: "paladinslive".into(),
+                    platform: LaunchPlatform::default(),
                     performance: None,
                     rollback_input: false,
                 },
@@ -1147,6 +1197,40 @@ mod tests {
             f.options.game_root.join(GAME).canonicalize().unwrap()
         );
         assert!(!f.options.game_root.join(".watchcat-localization").exists());
+    }
+
+    #[test]
+    fn login_platforms_pass_exactly_one_tempest_flag_and_preserve_the_native_plan() {
+        let mut f = Fixture::new();
+        let dll = f.dll("cache/selected.dll");
+        let pc = f.plan(std::slice::from_ref(&dll)).unwrap();
+        for (platform, flag) in [
+            (LaunchPlatform::Pc, None),
+            (LaunchPlatform::Steam, Some("-steam")),
+            (LaunchPlatform::Epic, Some("-epic")),
+        ] {
+            f.options.platform = platform;
+            let mut expected = pc.clone();
+            if let Some(flag) = flag {
+                expected.args.insert(0, flag.into());
+            }
+            let actual = f.plan(std::slice::from_ref(&dll)).unwrap();
+            assert_eq!(actual, expected);
+            assert!(!actual.args.iter().any(|arg| arg == "-nosteam"));
+            for other in ["-steam", "-epic"] {
+                assert_eq!(
+                    actual
+                        .args
+                        .iter()
+                        .filter(|arg| arg.as_str() == other)
+                        .count(),
+                    usize::from(Some(other) == flag)
+                );
+            }
+        }
+        for invalid in ["", "-steam", "steam -epic", "epic\n", "unknown"] {
+            assert!(LaunchPlatform::parse(invalid).is_err());
+        }
     }
 
     #[test]

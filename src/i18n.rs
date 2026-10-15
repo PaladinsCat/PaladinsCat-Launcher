@@ -74,15 +74,36 @@ impl UiLanguage {
 
 // Reviewable exact strings: (English source, initial Korean translation).
 const KOREAN: &[(&str, &str)] = &[
+    (
+        "Developer launch requires its original restart procedure",
+        "개발용 실행은 기존 절차로 재시작하세요",
+    ),
+    ("Check for launcher updates", "런처 업데이트 확인"),
+    ("Checking launcher updates…", "런처 업데이트 확인 중…"),
+    ("No launcher release published", "출시된 런처 버전 없음"),
+    ("Download and restart launcher", "다운로드 후 런처 재시작"),
+    ("Downloading launcher update", "런처 업데이트 다운로드 중"),
+    ("Restarting launcher", "런처 재시작 중"),
+    ("Updating…", "업데이트 중…"),
+    ("Restarting…", "재시작 중…"),
+    ("Retry update", "업데이트 재시도"),
+    (
+        "Launcher update unavailable; see Diagnostics",
+        "런처 업데이트 불가 · 진단 확인",
+    ),
     ("PaladinsCat Launcher", "PaladinsCat 런처"),
     ("Interface language", "런처 언어"),
     ("Game installation", "게임 설치 경로"),
     ("Browse…", "찾아보기…"),
+    ("Detect", "자동 검색"),
+    ("Detecting…", "검색 중…"),
+    ("Detected", "검색 결과"),
     ("Game language", "게임 언어"),
     ("English", "영어"),
     ("Korean", "한국어"),
     ("Profile", "프로필"),
     ("Play", "실행"),
+    ("Launch platform", "실행 플랫폼"),
     ("Performance", "성능"),
     ("Localization", "현지화"),
     ("Language", "언어"),
@@ -343,6 +364,7 @@ const KOREAN: &[(&str, &str)] = &[
 // byte-for-byte: no global replacement in package names, paths or diagnostics.
 // More specific forms precede wrappers whose final placeholder is unrestricted.
 const KOREAN_TEMPLATES: &[(&str, &str)] = &[
+    ("Update v{}", "v{} 업데이트"),
     (
         "Connected · {} translations · {} IME packages",
         "연결됨 · 번역 {}개 · IME 패키지 {}개",
