@@ -274,11 +274,7 @@ fn validate_profile(options: &Options) -> engine::Result<()> {
 /// and performance requires an explicitly selected, verified cached package.
 pub fn plan(options: &Options) -> engine::Result<Plan> {
     plan_with(options, |options, root| {
-        upk_patcher::require_hash(
-            &root.join(GAME),
-            performance::GAME_SHA,
-            "supported game executable",
-        )?;
+        validate_game_image(&root.join(GAME))?;
         let mut selected = Vec::new();
         if let Some(package) = ime::installed_package(root)? {
             upk_patcher::require_hash(
@@ -303,6 +299,27 @@ pub fn plan(options: &Options) -> engine::Result<Plan> {
         }
         Ok(selected)
     })
+}
+
+fn validate_game_image(path: &Path) -> engine::Result<()> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = File::open(path).map_err(error)?;
+    let mut dos = [0u8; 64];
+    let mut header = [0u8; 26];
+    file.read_exact(&mut dos)
+        .map_err(|_| "Supported game executable requires a DOS header")?;
+    let offset = u32::from_le_bytes(dos[60..64].try_into().unwrap());
+    if dos[..2] != *b"MZ" || !(64..=16 * 1024 * 1024).contains(&offset) {
+        return Err("Supported game executable has an invalid DOS header".into());
+    }
+    file.seek(SeekFrom::Start(u64::from(offset)))
+        .map_err(error)?;
+    file.read_exact(&mut header)
+        .map_err(|_| "Supported game executable has a truncated PE header")?;
+    if header[..4] != *b"PE\0\0" || header[4..6] != [0x64, 0x86] || header[24..26] != [0x0b, 0x02] {
+        return Err("Supported game executable must be Windows x64 PE32+".into());
+    }
+    Ok(())
 }
 
 fn plan_with(
@@ -1411,7 +1428,7 @@ mod tests {
         assert!(
             plan(&f.options)
                 .unwrap_err()
-                .contains("supported game executable hash mismatch")
+                .contains("Supported game executable")
         );
         assert!(!f.options.game_root.join(".watchcat-localization").exists());
         assert!(!f.home.join("logs").exists());

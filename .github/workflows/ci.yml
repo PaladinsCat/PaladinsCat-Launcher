@@ -21,3 +21,9 @@ jobs:
       - run: cargo run --locked --bin source_audit
       - run: cargo build --locked --release --bin paladinscat-launcher --bin paladinscat-release
       - run: cargo run --locked --example verify_icon -- target/release/paladinscat-launcher.exe
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: verified-launcher-${{ github.sha }}
+          path: target/release/paladinscat-launcher.exe
+          if-no-files-found: error
+          retention-days: 7

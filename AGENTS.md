@@ -4,6 +4,13 @@ Follow the parent PaladinsCat workspace publication boundary and canonical OpenV
 
 ## Main-only workspace
 
+Performance package versions, release URLs, asset sizes/checksums and compatibility
+fingerprints come from repository release metadata and its verified manifest.
+Never compile per-release pins, version exceptions or fixed version labels into
+the launcher. Preserve bounded downloads, canonical-source checks, manifest and
+member integrity checks, and compatibility checks against the selected manifest.
+Regression tests must accept a future compatible version without source edits.
+
 The user requires this project's existing checkout to stay on `main` and prohibits agent-created pull requests. Do not create or switch to feature branches, auxiliary worktrees, forks or alternate source checkouts. Do not create a PR for a fix, release or catalog update. Before editing, verify `git branch --show-current` and `git worktree list --porcelain`. Preserve existing fixes and unrelated work when correcting checkout state. Generic contributor PR instructions do not override this direct human rule. Keep review and checks on existing `main`; publication requires its established authorization and must respect remote protections. A protection failure is not permission to create a PR or bypass it.
 
 ## Launcher delivery and version control

@@ -1,4 +1,4 @@
-//! Pinned public performance packages. This module never runs package executables,
+//! GitHub-discovered performance packages. This module never runs package executables,
 //! installs game files, injects DLLs, or changes rendering/input settings.
 //!
 //! Native fingerprints originate from the MIT-licensed PaladinsCat-mods release
@@ -12,48 +12,27 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 pub use crate::sources::{
     PERFORMANCE_RELEASE_URL as RELEASE_URL, PERFORMANCE_REPOSITORY as REPOSITORY,
-    PERFORMANCE_VERSION as VERSION,
 };
 const MANIFEST: &str = "manifest.json";
-const ARCHIVE: &str = "PaladinsCat-performance-v0.1.0-windows-x64.zip";
 const SUMS: &str = "SHA256SUMS.txt";
-const MANIFEST_SHA: &str = "7681f8572fa92ce49731ffa3d21ee62f37437aaeef07f95b85b54b68308b3f24";
-const MANIFEST_BYTES: u64 = 1844;
-const ARCHIVE_SHA: &str = "428a1703ab3a1faecc30fd21d914ad34f2de5f0d90a1637244d87bba83f260cc";
-const ARCHIVE_BYTES: u64 = 720701;
-const SUMS_SHA: &str = "1da28fc642ecf2f35dda771b63870dd5334a35c7fedb3e62e7ea3d26f6f67bac";
-const SOURCE_REVISION: &str = "635a3469532a605b02af0a9ac9b9a7bf32a1fb91";
 const LIMIT: u64 = 1024 * 1024;
 const JSON_LIMIT: u64 = 16 * 1024;
-pub const GAME_SHA: &str = "0c51d381dfe9ecbc1f571ab36603478626375704f4e4e40482524a1adafd6f75";
-pub const DINPUT_SHA: &str = "b0f10001fccd05e9863d84588be9b9f8389656d95177287dd4c6cf3be4bf1dfe";
-pub const USER32_SHA: &str = "f285937030bcb325cad39ee5be4818f6666241229adeadea4ff1ae469dfd7ef3";
-pub const PAYLOADS: [(&str, &str, u64); 3] = [
-    (
-        "watchcat-native-input-compact-modifier.dll",
-        "f45578bc07a204dd3b992a5faca7945ca1695b8a9386f4ac0072ec9b463a3f1d",
-        134144,
-    ),
-    (
-        "watchcat-world-scheduler.dll",
-        "2b5893da71714f36548146d466f310490f859354803a0d0a71123bc53464e0e4",
-        135168,
-    ),
-    (
-        "watchcat-native-input-raw-read-original.dll",
-        "2da0b9da101ddf82bbc7e2f3a61205b47e96bd9200864bb86854d4fb17de61e6",
-        151552,
-    ),
+const RECEIPT: &str = "github-release.json";
+const METADATA_LIMIT: u64 = 256 * 1024;
+pub const PAYLOADS: [&str; 3] = [
+    "watchcat-native-input-compact-modifier.dll",
+    "watchcat-world-scheduler.dll",
+    "watchcat-native-input-raw-read-original.dll",
 ];
 const ASSET_NAMES: [&str; 8] = [
-    PAYLOADS[0].0,
-    PAYLOADS[1].0,
-    PAYLOADS[2].0,
+    PAYLOADS[0],
+    PAYLOADS[1],
+    PAYLOADS[2],
     "paladinscat-mods.exe",
     "README.md",
     "RELEASE_NOTES.md",
@@ -92,6 +71,176 @@ pub struct Package {
 pub struct Cached {
     pub package: Package,
     pub directory: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Release {
+    pub version: String,
+    pub manifest: Asset,
+    pub archive: Asset,
+    pub checksums: Asset,
+}
+fn stable_version(value: &str) -> bool {
+    let parts = value.split('.').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && (part.len() == 1 || !part.starts_with('0'))
+                && part.bytes().all(|b| b.is_ascii_digit())
+                && part.parse::<u32>().is_ok()
+        })
+}
+impl Release {
+    pub fn page(&self) -> String {
+        format!(
+            "https://github.com/{REPOSITORY}/releases/tag/v{}",
+            self.version
+        )
+    }
+    fn validate(&self) -> Result<()> {
+        if !stable_version(&self.version) {
+            return Err("Invalid stable performance release version".into());
+        }
+        for (asset, name, limit) in [
+            (&self.manifest, MANIFEST.to_string(), JSON_LIMIT),
+            (
+                &self.archive,
+                format!("PaladinsCat-performance-v{}-windows-x64.zip", self.version),
+                LIMIT,
+            ),
+            (&self.checksums, SUMS.to_string(), JSON_LIMIT),
+        ] {
+            if asset.name != name || !hash(&asset.sha256) || asset.bytes == 0 || asset.bytes > limit
+            {
+                return Err("Invalid performance release asset identity, digest or size".into());
+            }
+        }
+        Ok(())
+    }
+    fn package(&self, bytes: &[u8]) -> Result<Package> {
+        self.validate()?;
+        if bytes.len() as u64 != self.manifest.bytes || digest(bytes) != self.manifest.sha256 {
+            return Err("Performance manifest differs from GitHub's digest or size".into());
+        }
+        let package: Package = serde_json::from_slice(bytes).map_err(error)?;
+        validate_contents(&package)?;
+        if package.version != self.version
+            || package.source_revision.len() != 40
+            || !package
+                .source_revision
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit())
+        {
+            return Err("Performance manifest release/source identity mismatch".into());
+        }
+        Ok(package)
+    }
+}
+pub fn parse_release(bytes: &[u8]) -> Result<Release> {
+    #[derive(Deserialize)]
+    struct GithubRelease {
+        tag_name: String,
+        draft: bool,
+        prerelease: bool,
+        html_url: String,
+        assets: Vec<GithubAsset>,
+    }
+    #[derive(Deserialize)]
+    struct GithubAsset {
+        name: String,
+        browser_download_url: String,
+        size: u64,
+        digest: Option<String>,
+        state: String,
+    }
+    if bytes.len() as u64 > METADATA_LIMIT {
+        return Err("Performance release metadata exceeds its limit".into());
+    }
+    let github: GithubRelease = serde_json::from_slice(bytes).map_err(error)?;
+    let version = github
+        .tag_name
+        .strip_prefix('v')
+        .ok_or("Performance tag must start with v")?;
+    if github.draft || github.prerelease || !stable_version(version) {
+        return Err("Only published stable performance releases are supported".into());
+    }
+    let asset = |name: &str| -> Result<Asset> {
+        let matches = github
+            .assets
+            .iter()
+            .filter(|a| a.name == name)
+            .collect::<Vec<_>>();
+        let [value] = matches.as_slice() else {
+            return Err("Missing or duplicate performance release asset".into());
+        };
+        if value.state != "uploaded"
+            || value.browser_download_url != crate::sources::performance_asset_url(version, name)
+        {
+            return Err("Performance asset has an unexpected source or upload state".into());
+        }
+        Ok(Asset {
+            name: name.into(),
+            bytes: value.size,
+            sha256: value
+                .digest
+                .as_deref()
+                .and_then(|d| d.strip_prefix("sha256:"))
+                .ok_or("GitHub did not supply a performance asset SHA-256")?
+                .to_ascii_lowercase(),
+        })
+    };
+    let release = Release {
+        version: version.into(),
+        manifest: asset(MANIFEST)?,
+        archive: asset(&format!(
+            "PaladinsCat-performance-v{version}-windows-x64.zip"
+        ))?,
+        checksums: asset(SUMS)?,
+    };
+    release.validate()?;
+    if github.html_url != release.page() {
+        return Err("Unexpected performance release repository".into());
+    }
+    Ok(release)
+}
+fn check_url(url: &str) -> Result<Release> {
+    let response = ureq::AgentBuilder::new()
+        .https_only(true)
+        .timeout(Duration::from_secs(30))
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(20))
+        .build()
+        .get(url)
+        .set(
+            "User-Agent",
+            concat!("PaladinsCat-Launcher/", env!("CARGO_PKG_VERSION")),
+        )
+        .set("Accept", "application/vnd.github+json")
+        .call()
+        .map_err(error)?;
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take(METADATA_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(error)?;
+    parse_release(&bytes)
+}
+pub fn check() -> Result<Release> {
+    check_url(crate::sources::PERFORMANCE_RELEASE_API)
+}
+fn check_version(version: &str) -> Result<Release> {
+    if !stable_version(version) {
+        return Err("Invalid performance version".into());
+    }
+    let release = check_url(&format!(
+        "https://api.github.com/repos/{REPOSITORY}/releases/tags/v{version}"
+    ))?;
+    if release.version != version {
+        return Err("Performance release tag mismatch".into());
+    }
+    Ok(release)
 }
 
 fn error(e: impl std::fmt::Display) -> String {
@@ -176,18 +325,14 @@ fn pinned(path: &Path, sha: &str, length: Option<u64>) -> Result<()> {
     }
     Ok(())
 }
-fn validate(package: &Package) -> Result<()> {
+fn validate_contents(package: &Package) -> Result<()> {
     if package.schema != 1
-        || package.version != VERSION
+        || !stable_version(&package.version)
         || package.mod_id != "paladins-performance"
         || package.platform != "windows-x86_64"
-        || package.source_revision != SOURCE_REVISION
-        || package.game_sha256 != GAME_SHA
-        || package.dinput8_sha256 != DINPUT_SHA
-        || package.user32_sha256 != USER32_SHA
-        || package.performance_verified
-        || package.compatibility_verified
-        || package.rendering != "uncapped; 1000 FPS target is not a limiter"
+        || !hash(&package.game_sha256)
+        || !hash(&package.dinput8_sha256)
+        || !hash(&package.user32_sha256)
         || package.assets.len() != ASSET_NAMES.len()
     {
         return Err(
@@ -212,24 +357,12 @@ fn validate(package: &Package) -> Result<()> {
     if total > LIMIT {
         return Err("Performance package exceeds expanded size limit".into());
     }
-    for (name, sha, bytes) in PAYLOADS {
-        if !package
-            .assets
-            .iter()
-            .any(|a| a.name == name && a.sha256 == sha && a.bytes == bytes)
-        {
-            return Err("Performance DLL native pin mismatch".into());
-        }
-    }
     Ok(())
 }
-fn parse(bytes: &[u8]) -> Result<Package> {
-    if bytes.len() as u64 != MANIFEST_BYTES || digest(bytes) != MANIFEST_SHA {
-        return Err("The performance manifest is not the pinned published v0.1.0 release".into());
-    }
-    let package = serde_json::from_slice(bytes).map_err(error)?;
-    validate(&package)?;
-    Ok(package)
+fn parse_cached(directory: &Path, bytes: &[u8]) -> Result<Package> {
+    let release: Release =
+        serde_json::from_slice(&read(&directory.join(RECEIPT), JSON_LIMIT)?).map_err(error)?;
+    release.package(bytes)
 }
 fn sums(bytes: &[u8]) -> Result<BTreeMap<String, String>> {
     let text = std::str::from_utf8(bytes).map_err(error)?;
@@ -269,12 +402,16 @@ fn inventory(directory: &Path) -> Result<()> {
             .file_name()
             .into_string()
             .map_err(|_| "Non-Unicode performance member")?;
-        if !ASSET_NAMES.contains(&name.as_str()) && name != MANIFEST && name != SUMS {
+        if !ASSET_NAMES.contains(&name.as_str())
+            && name != MANIFEST
+            && name != SUMS
+            && name != RECEIPT
+        {
             return Err("Unexpected member in cached performance package".into());
         }
         seen.insert(name);
     }
-    if seen.len() != ASSET_NAMES.len() + 2 {
+    if seen.len() != ASSET_NAMES.len() + 3 || !seen.contains(RECEIPT) {
         return Err("Incomplete cached performance package".into());
     }
     Ok(())
@@ -314,7 +451,7 @@ pub fn verify(cached: &Cached) -> Result<()> {
     }
     inventory(&cached.directory)?;
     let bytes = read(&manifest_path(cached), JSON_LIMIT)?;
-    let package = parse(&bytes)?;
+    let package = parse_cached(&cached.directory, &bytes)?;
     if package != cached.package {
         return Err("Performance settings do not match cached release manifest".into());
     }
@@ -332,15 +469,16 @@ pub fn verify(cached: &Cached) -> Result<()> {
     )
 }
 
-/// Exactly one input variant plus the unchanged world scheduler. Never executes.
+/// Select the package's input variant and scheduler after metadata verification.
 pub fn dlls(cached: &Cached, rollback: bool) -> Result<Vec<PathBuf>> {
     verify(cached)?;
-    Ok(vec![
+    let selected = vec![
         cached
             .directory
-            .join(PAYLOADS[if rollback { 2 } else { 0 }].0),
-        cached.directory.join(PAYLOADS[1].0),
-    ])
+            .join(PAYLOADS[if rollback { 2 } else { 0 }]),
+        cached.directory.join(PAYLOADS[1]),
+    ];
+    Ok(selected)
 }
 
 /// Fail closed after game/Windows updates; retain original mod native pins.
@@ -351,11 +489,19 @@ pub fn preflight(cached: &Cached, game_root: &Path, system: &Path) -> Result<()>
     verify(cached)?;
     pinned(
         &game_root.join("Binaries/Win64/Paladins.exe"),
-        GAME_SHA,
+        &cached.package.game_sha256,
         None,
     )?;
-    pinned(&system.join("dinput8.dll"), DINPUT_SHA, None)?;
-    pinned(&system.join("user32.dll"), USER32_SHA, None)
+    pinned(
+        &system.join("dinput8.dll"),
+        &cached.package.dinput8_sha256,
+        None,
+    )?;
+    pinned(
+        &system.join("user32.dll"),
+        &cached.package.user32_sha256,
+        None,
+    )
 }
 
 fn unpack(archive: &Path, package: &Package, manifest: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
@@ -451,7 +597,12 @@ fn stage(cache: &Path, package: Package, members: BTreeMap<String, Vec<u8>>) -> 
     fs::create_dir_all(cache).map_err(error)?;
     plain(cache, true)?;
     let cache = cache.canonicalize().map_err(error)?;
-    let destination = cache.join(MANIFEST_SHA);
+    let manifest_sha = digest(
+        members
+            .get(MANIFEST)
+            .ok_or("Missing performance manifest")?,
+    );
+    let destination = cache.join(manifest_sha);
     if destination.exists() {
         let current = Cached {
             package: package.clone(),
@@ -485,17 +636,19 @@ fn stage(cache: &Path, package: Package, members: BTreeMap<String, Vec<u8>>) -> 
     })
 }
 
-/// Downloads only the explicitly pinned v0.1.0 public release, never a floating
-/// latest URL. Archive, manifest and outer checksums have independent pins.
+/// Discover the current stable release, then download its immutable asset URLs
+/// using GitHub-provided digests and sizes. No package version is compiled in.
 pub fn download(cache: &Path, progress: Progress<'_>) -> Result<Cached> {
+    progress("Checking performance releases…".into());
+    let release = check()?;
     let _lease = crate::cache::lock(cache)?;
     let mut attempt = crate::cache::Attempt::begin(cache, &["performance"])?;
     let root = performance_cache(cache)?;
-    let existing = root.join(MANIFEST_SHA);
+    let existing = root.join(&release.manifest.sha256);
     if existing.exists() {
         plain(&existing, true)?;
         if let Ok(package) =
-            read(&existing.join(MANIFEST), JSON_LIMIT).and_then(|bytes| parse(&bytes))
+            read(&existing.join(MANIFEST), JSON_LIMIT).and_then(|bytes| release.package(&bytes))
         {
             let cached = Cached {
                 package,
@@ -514,32 +667,35 @@ pub fn download(cache: &Path, progress: Progress<'_>) -> Result<Cached> {
         }
     }
     let downloads = cache_directory(&root, "downloads")?;
-    progress("Downloading pinned performance package v0.1.0…".into());
-    for (name, sha, bytes) in [
-        (MANIFEST, MANIFEST_SHA, MANIFEST_BYTES),
-        (ARCHIVE, ARCHIVE_SHA, ARCHIVE_BYTES),
-        (SUMS, SUMS_SHA, 193),
-    ] {
-        let path = downloads.join(name);
+    progress(format!(
+        "Downloading performance package v{}…",
+        release.version
+    ));
+    for asset in [&release.manifest, &release.archive, &release.checksums] {
+        let path = downloads.join(&asset.name);
         if path.exists() {
             plain(&path, false)?;
         }
         engine::fetch(
-            &crate::sources::performance_asset_url(name),
+            &crate::sources::performance_asset_url(&release.version, &asset.name),
             &path,
-            sha,
-            Some(bytes),
+            &asset.sha256,
+            Some(asset.bytes),
             progress,
         )?;
-        pinned(&path, sha, Some(bytes))?;
+        pinned(&path, &asset.sha256, Some(asset.bytes))?;
     }
     let manifest = read(&downloads.join(MANIFEST), JSON_LIMIT)?;
-    let package = parse(&manifest)?;
-    let expected = format!("{ARCHIVE_SHA}  {ARCHIVE}\n{MANIFEST_SHA}  {MANIFEST}\n");
+    let package = release.package(&manifest)?;
+    let expected = format!(
+        "{}  {}\n{}  {MANIFEST}\n",
+        release.archive.sha256, release.archive.name, release.manifest.sha256
+    );
     if read(&downloads.join(SUMS), JSON_LIMIT)? != expected.as_bytes() {
         return Err("Published performance archive checksum inventory mismatch".into());
     }
-    let members = unpack(&downloads.join(ARCHIVE), &package, &manifest)?;
+    let mut members = unpack(&downloads.join(&release.archive.name), &package, &manifest)?;
+    members.insert(RECEIPT.into(), serde_json::to_vec(&release).map_err(error)?);
     let cached = stage(&root, package, members)?;
     attempt.commit();
     crate::cache::prepared_cleanup(crate::cache::retain_family(
@@ -551,32 +707,48 @@ pub fn download(cache: &Path, progress: Progress<'_>) -> Result<Cached> {
     Ok(cached)
 }
 
-/// Imports either the release manifest beside its pinned ZIP, or a fully
-/// extracted release directory. No executable/helper is run during import.
+/// Restore owned verified cache generations offline. New imports are checked
+/// against their GitHub tag metadata before any package files are accepted.
 pub fn import(manifest: &Path, cache: &Path) -> Result<Cached> {
-    let _lease = crate::cache::lock(cache)?;
-    let mut attempt = crate::cache::Attempt::begin(cache, &["performance"])?;
     let bytes = read(manifest, JSON_LIMIT)?;
-    let package = parse(&bytes)?;
     let source = manifest
         .parent()
         .ok_or("Performance manifest has no parent directory")?;
-    let archive = source.join(ARCHIVE);
-    let members = if archive.exists() {
-        pinned(&archive, ARCHIVE_SHA, Some(ARCHIVE_BYTES))?;
+    let directory = source.canonicalize().map_err(error)?;
+    if cache
+        .canonicalize()
+        .ok()
+        .is_some_and(|root| directory == root.join("performance").join(digest(&bytes)))
+    {
+        let cached = Cached {
+            package: parse_cached(&directory, &bytes)?,
+            directory,
+        };
+        verify(&cached)?;
+        return Ok(cached);
+    }
+    let untrusted: Package = serde_json::from_slice(&bytes).map_err(error)?;
+    validate_contents(&untrusted)?;
+    let release = check_version(&untrusted.version)?;
+    let package = release.package(&bytes)?;
+    let _lease = crate::cache::lock(cache)?;
+    let mut attempt = crate::cache::Attempt::begin(cache, &["performance"])?;
+    let archive = source.join(&release.archive.name);
+    let mut members = if archive.exists() {
+        pinned(
+            &archive,
+            &release.archive.sha256,
+            Some(release.archive.bytes),
+        )?;
         unpack(&archive, &package, &bytes)?
     } else {
-        let current = Cached {
-            package: package.clone(),
-            directory: source.canonicalize().map_err(error)?,
-        };
-        verify(&current)?;
         let mut members = BTreeMap::new();
         for name in ASSET_NAMES.into_iter().chain([MANIFEST, SUMS]) {
             members.insert(name.into(), read(&source.join(name), LIMIT)?);
         }
         members
     };
+    members.insert(RECEIPT.into(), serde_json::to_vec(&release).map_err(error)?);
     let cached = stage(&performance_cache(cache)?, package, members)?;
     attempt.commit();
     crate::cache::prepared_cleanup(crate::cache::retain_family(
@@ -595,6 +767,105 @@ mod tests {
 
     type Entries = Vec<(String, Vec<u8>)>;
 
+    #[test]
+    fn loader_contains_no_compiled_release_version_or_checksum_pins() {
+        for source in [include_str!("performance.rs"), include_str!("sources.rs")] {
+            let production = source.split("#[cfg(test)]").next().unwrap();
+            for literal in production.split('"').skip(1).step_by(2) {
+                assert!(
+                    !stable_version(literal) && !hash(literal),
+                    "Compiled release data: {literal}"
+                );
+                assert!(!literal.contains("/releases/download/v0."));
+            }
+        }
+    }
+
+    fn metadata_fixture(version: &str) -> serde_json::Value {
+        let asset = |name: String| {
+            serde_json::json!({
+                "name":name, "state":"uploaded", "size":128,
+                "digest":format!("sha256:{}", "a".repeat(64)),
+                "browser_download_url":crate::sources::performance_asset_url(version, &name)
+            })
+        };
+        serde_json::json!({"tag_name":format!("v{version}"),"draft":false,"prerelease":false,
+            "html_url":format!("https://github.com/{REPOSITORY}/releases/tag/v{version}"),
+            "assets":[asset(MANIFEST.into()),asset(format!("PaladinsCat-performance-v{version}-windows-x64.zip")),asset(SUMS.into())]})
+    }
+    #[test]
+    fn future_release_is_discovered_without_compiled_package_values() {
+        for version in ["0.1.1", "0.1.2", "71.23.109"] {
+            let release =
+                parse_release(&serde_json::to_vec(&metadata_fixture(version)).unwrap()).unwrap();
+            assert_eq!(release.version, version);
+            assert_eq!(release.manifest.sha256, "a".repeat(64));
+        }
+    }
+    #[test]
+    fn metadata_refuses_missing_digests_wrong_sources_drafts_and_duplicates() {
+        for case in 0..7 {
+            let mut value = metadata_fixture("71.23.109");
+            match case {
+                0 => value["draft"] = true.into(),
+                1 => value["prerelease"] = true.into(),
+                2 => value["assets"][0]["digest"] = serde_json::Value::Null,
+                3 => {
+                    value["assets"][0]["browser_download_url"] =
+                        "https://example.com/mod.dll".into()
+                }
+                4 => {
+                    value["html_url"] =
+                        "https://github.com/other/repo/releases/tag/v71.23.109".into()
+                }
+                5 => value["assets"][0]["size"] = (JSON_LIMIT + 1).into(),
+                _ => {
+                    let duplicate = value["assets"][0].clone();
+                    value["assets"].as_array_mut().unwrap().push(duplicate);
+                }
+            }
+            assert!(
+                parse_release(&serde_json::to_vec(&value).unwrap()).is_err(),
+                "case {case}"
+            );
+        }
+    }
+    #[test]
+    fn manifest_and_compatibility_come_from_metadata_and_restore_offline() {
+        let (package, manifest, entries) = fixture();
+        let mut release =
+            parse_release(&serde_json::to_vec(&metadata_fixture(&package.version)).unwrap())
+                .unwrap();
+        release.manifest.sha256 = digest(&manifest);
+        release.manifest.bytes = manifest.len() as u64;
+        assert_eq!(release.package(&manifest).unwrap(), package);
+        let mut changed = manifest.clone();
+        changed.push(b' ');
+        assert!(release.package(&changed).is_err());
+        let cache = temp();
+        let mut members = unpack(&archive(&entries, false), &package, &manifest).unwrap();
+        members.insert(RECEIPT.into(), serde_json::to_vec(&release).unwrap());
+        let cached = stage(
+            &performance_cache(&cache).unwrap(),
+            package.clone(),
+            members,
+        )
+        .unwrap();
+        assert_eq!(
+            import(&manifest_path(&cached), &cache).unwrap().directory,
+            cached.directory
+        );
+        let game = temp();
+        let system = temp();
+        fs::create_dir_all(game.join("Binaries/Win64")).unwrap();
+        fs::write(game.join("Binaries/Win64/Paladins.exe"), b"game fixture").unwrap();
+        fs::write(system.join("dinput8.dll"), b"dinput fixture").unwrap();
+        fs::write(system.join("user32.dll"), b"user32 fixture").unwrap();
+        preflight(&cached, &game, &system).unwrap();
+        fs::write(system.join("user32.dll"), b"changed Windows fixture").unwrap();
+        assert!(preflight(&cached, &game, &system).is_err());
+    }
+
     fn temp() -> PathBuf {
         let root = std::env::temp_dir().join(format!("paladinscat-performance-test-{}", unique()));
         fs::create_dir(&root).unwrap();
@@ -611,13 +882,13 @@ mod tests {
             .collect();
         let package = Package {
             schema: 1,
-            version: VERSION.into(),
+            version: "99.4.3".into(),
             mod_id: "paladins-performance".into(),
             platform: "windows-x86_64".into(),
-            source_revision: SOURCE_REVISION.into(),
-            game_sha256: GAME_SHA.into(),
-            dinput8_sha256: DINPUT_SHA.into(),
-            user32_sha256: USER32_SHA.into(),
+            source_revision: "a".repeat(40),
+            game_sha256: digest(b"game fixture"),
+            dinput8_sha256: digest(b"dinput fixture"),
+            user32_sha256: digest(b"user32 fixture"),
             performance_verified: false,
             compatibility_verified: false,
             rendering: "uncapped; 1000 FPS target is not a limiter".into(),
@@ -659,7 +930,7 @@ mod tests {
         let (package, manifest, entries) = fixture();
         let result = unpack(&archive(&entries, false), &package, &manifest).unwrap();
         assert_eq!(result.len(), 10);
-        assert_eq!(result[PAYLOADS[1].0], PAYLOADS[1].0.as_bytes());
+        assert_eq!(result[PAYLOADS[1]], PAYLOADS[1].as_bytes());
     }
     #[test]
     fn zip_rejects_traversal_unexpected_case_and_symlink_members() {
@@ -746,30 +1017,26 @@ mod tests {
         assert!(unpack(&archive(&changed, false), &package, &manifest).is_err());
     }
     #[test]
-    fn native_pins_and_unverified_release_claims_cannot_be_relaxed() {
-        let (mut package, _, _) = fixture();
-        for (name, sha, bytes) in PAYLOADS {
-            let asset = package.assets.iter_mut().find(|a| a.name == name).unwrap();
-            asset.sha256 = sha.into();
-            asset.bytes = bytes;
-        }
-        validate(&package).unwrap();
+    fn manifest_compatibility_fingerprints_and_asset_inventory_are_validated() {
+        let (package, _, _) = fixture();
+        validate_contents(&package).unwrap();
         for field in [0, 1, 2, 3, 4] {
             let mut changed = package.clone();
             match field {
-                0 => changed.game_sha256 = "0".repeat(64),
-                1 => changed.dinput8_sha256 = "0".repeat(64),
-                2 => changed.user32_sha256 = "0".repeat(64),
-                3 => changed.assets[0].sha256 = "0".repeat(64),
-                _ => changed.compatibility_verified = true,
+                0 => changed.game_sha256 = "bad".into(),
+                1 => changed.dinput8_sha256 = "bad".into(),
+                2 => changed.user32_sha256 = "bad".into(),
+                3 => changed.assets[0].sha256 = "bad".into(),
+                _ => changed.assets[0].name = "unexpected.dll".into(),
             }
-            assert!(validate(&changed).is_err());
+            assert!(validate_contents(&changed).is_err());
         }
     }
     #[test]
     fn unpinned_manifest_and_settings_never_prepare_or_enable_payloads() {
-        let (package, manifest, _) = fixture();
-        assert!(parse(&manifest).is_err());
+        let (mut package, _, _) = fixture();
+        package.version = "unreleased".into();
+        let manifest = serde_json::to_vec(&package).unwrap();
         let root = temp();
         fs::write(root.join(MANIFEST), manifest).unwrap();
         assert!(import(&root.join(MANIFEST), &root.join("cache")).is_err());
@@ -789,6 +1056,7 @@ mod tests {
         for name in ASSET_NAMES.into_iter().chain([MANIFEST, SUMS]) {
             fs::write(root.join(name), name).unwrap();
         }
+        fs::write(root.join(RECEIPT), b"fixture").unwrap();
         inventory(&root).unwrap();
         fs::write(root.join("unexpected.dll"), b"never allowed").unwrap();
         assert!(inventory(&root).unwrap_err().contains("Unexpected"));
@@ -796,6 +1064,7 @@ mod tests {
         for name in ASSET_NAMES.into_iter().chain([MANIFEST, SUMS]) {
             fs::write(root.join(name), name).unwrap();
         }
+        fs::write(root.join(RECEIPT), b"fixture").unwrap();
         fs::create_dir(root.join("subdirectory")).unwrap();
         assert!(inventory(&root).is_err());
     }
@@ -808,9 +1077,14 @@ mod tests {
         verify(&cached).unwrap();
         let current = dlls(&cached, false).unwrap();
         let rollback = dlls(&cached, true).unwrap();
-        assert_eq!(current[0].file_name().unwrap(), PAYLOADS[0].0);
-        assert_eq!(rollback[0].file_name().unwrap(), PAYLOADS[2].0);
-        assert_eq!(current[1], rollback[1]);
+        assert_eq!(current.len(), 2);
+        assert_eq!(rollback.len(), 2);
+        assert_eq!(current[0].file_name().unwrap(), PAYLOADS[0]);
+        assert_eq!(rollback[0].file_name().unwrap(), PAYLOADS[2]);
+        assert!(
+            current[1].file_name().unwrap() == PAYLOADS[1]
+                && rollback[1].file_name().unwrap() == PAYLOADS[1]
+        );
         let imported = import(&manifest_path(&cached), &root.join("import-cache")).unwrap();
         verify(&imported).unwrap();
         assert_eq!(imported.package, cached.package);

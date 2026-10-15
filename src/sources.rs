@@ -6,11 +6,10 @@ pub const LAUNCHER_RELEASE_API: &str =
 
 pub const LOCALE_REPOSITORY: &str = "PaladinsCat/PaladinsCat-locales";
 pub const PERFORMANCE_REPOSITORY: &str = "PaladinsCat/PaladinsCat-mods";
-pub const PERFORMANCE_VERSION: &str = "0.1.0";
+pub const PERFORMANCE_RELEASE_API: &str =
+    "https://api.github.com/repos/PaladinsCat/PaladinsCat-mods/releases/latest";
 pub const PERFORMANCE_RELEASE_URL: &str =
-    "https://github.com/PaladinsCat/PaladinsCat-mods/releases/tag/v0.1.0";
-pub const PERFORMANCE_BASE_URL: &str =
-    "https://github.com/PaladinsCat/PaladinsCat-mods/releases/download/v0.1.0";
+    "https://github.com/PaladinsCat/PaladinsCat-mods/releases/latest";
 
 pub fn repository_url(repository: &str) -> String {
     format!("https://github.com/{}", repository.trim())
@@ -23,8 +22,8 @@ pub fn catalog_url(repository: &str) -> String {
     )
 }
 
-pub fn performance_asset_url(name: &str) -> String {
-    format!("{PERFORMANCE_BASE_URL}/{name}")
+pub fn performance_asset_url(version: &str, name: &str) -> String {
+    format!("https://github.com/{PERFORMANCE_REPOSITORY}/releases/download/v{version}/{name}")
 }
 
 #[cfg(test)]
@@ -36,9 +35,9 @@ mod tests {
         assert!(catalog_url(LOCALE_REPOSITORY).contains("PaladinsCat-locales/main/game-client/"));
         assert!(repository_url(PERFORMANCE_REPOSITORY).ends_with("/PaladinsCat-mods"));
         assert_eq!(
-            performance_asset_url("manifest.json"),
-            format!("{PERFORMANCE_BASE_URL}/manifest.json")
+            performance_asset_url("0.1.2", "manifest.json"),
+            "https://github.com/PaladinsCat/PaladinsCat-mods/releases/download/v0.1.2/manifest.json"
         );
-        assert!(!PERFORMANCE_BASE_URL.contains("PaladinsCat-locales"));
+        assert!(!PERFORMANCE_RELEASE_API.contains("PaladinsCat-locales"));
     }
 }

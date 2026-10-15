@@ -99,6 +99,7 @@ struct Startup {
     translation: Option<engine::Result<Box<Cached>>>,
     ime: Option<engine::Result<Box<ime::Cached>>>,
     performance: Option<engine::Result<Box<performance::Cached>>>,
+    performance_release: Option<Box<performance::Release>>,
 }
 #[derive(Default)]
 struct PreparedPaths {
@@ -132,6 +133,7 @@ impl Startup {
             translation,
             ime,
             performance,
+            performance_release: performance::check().ok().map(Box::new),
         }
     }
 }
@@ -232,6 +234,7 @@ struct App {
     catalog_status: String,
     catalog_connected: bool,
     performance_selected: Option<performance::Cached>,
+    performance_release: Option<Box<performance::Release>>,
     launcher_update: LauncherUpdate,
     update_receiver: Option<Receiver<UpdateEvent>>,
     update_frames: u8,
@@ -377,6 +380,7 @@ impl App {
             catalog_status: "Catalog not checked".into(),
             catalog_connected: false,
             performance_selected: None,
+            performance_release: None,
             launcher_update: LauncherUpdate::Idle,
             update_receiver: None,
             update_frames: 0,
@@ -646,6 +650,7 @@ impl App {
                                     }
                                 }
                             }
+                            self.performance_release = startup.performance_release;
                             if let Some(result) = startup.performance {
                                 match result {
                                     Ok(package) => self.accept_performance(*package),
@@ -947,10 +952,28 @@ impl App {
     }
     fn tab_source(&self, tab: PackageTab) -> (String, String, String) {
         if tab == PackageTab::Performance {
+            let version = self
+                .performance_selected
+                .as_ref()
+                .map(|p| p.package.version.as_str())
+                .or_else(|| {
+                    self.performance_release
+                        .as_ref()
+                        .map(|r| r.version.as_str())
+                });
             return (
                 performance::REPOSITORY.into(),
-                performance::RELEASE_URL.into(),
-                format!("Pinned release · v{}", performance::VERSION),
+                version
+                    .map(|v| {
+                        format!(
+                            "https://github.com/{}/releases/tag/v{v}",
+                            performance::REPOSITORY
+                        )
+                    })
+                    .unwrap_or_else(|| performance::RELEASE_URL.into()),
+                version
+                    .map(|v| format!("Release · v{v}"))
+                    .unwrap_or_else(|| "GitHub releases".into()),
             );
         }
         let status = if self.catalog_connected {
@@ -1012,7 +1035,21 @@ impl App {
             if self.tab == PackageTab::Performance {
                 ui.hyperlink_to(
                     language.text("Manifest"),
-                    sources::performance_asset_url("manifest.json"),
+                    self.performance_selected
+                        .as_ref()
+                        .map(|p| p.package.version.as_str())
+                        .or_else(|| {
+                            self.performance_release
+                                .as_ref()
+                                .map(|r| r.version.as_str())
+                        })
+                        .map(|v| sources::performance_asset_url(v, "manifest.json"))
+                        .unwrap_or_else(|| {
+                            format!(
+                                "https://github.com/{}/releases/latest/download/manifest.json",
+                                performance::REPOSITORY
+                            )
+                        }),
                 );
             } else {
                 ui.add_enabled_ui(!busy, |ui| {
@@ -1879,7 +1916,7 @@ fn main() -> eframe::Result<()> {
             "feature_sources": {
                 "localization": {"repository": settings.repository, "url": settings.source_url(), "packages": startup.catalog.as_ref().map(|c|c.packages.len())},
                 "ime": {"repository": settings.repository, "url": settings.source_url(), "packages": startup.catalog.as_ref().map(|c|c.ime_packages.len())},
-                "performance": {"repository": performance::REPOSITORY, "url": performance::RELEASE_URL, "version": performance::VERSION}
+                "performance": {"repository": performance::REPOSITORY, "url": performance::RELEASE_URL, "version": startup.performance_release.as_ref().map(|r| &r.version)}
             },
             "cpu_only": true,
             "game_files_changed": false,
@@ -2324,10 +2361,7 @@ mod tests {
             app.tab_source(PackageTab::Translation).2,
             "Catalog unavailable"
         );
-        assert_eq!(
-            app.tab_source(PackageTab::Performance).2,
-            "Pinned release · v0.1.0"
-        );
+        assert_eq!(app.tab_source(PackageTab::Performance).2, "GitHub releases");
     }
 
     fn catalog_fixture(translation: bool, ime: bool) -> engine::Catalog {
@@ -2339,6 +2373,28 @@ mod tests {
             value["ime_packages"] = serde_json::json!([{"package_id":"ime-fixture","version":"0.1.0","game_build":"8.1","manifest_url":"https://github.com/PaladinsCat/PaladinsCat-locales/releases/download/fixture/ime-package.json","manifest_sha256":"b".repeat(64)}]);
         }
         engine::parse_catalog(&serde_json::to_vec(&value).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn performance_source_displays_discovered_and_selected_versions() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, true);
+        let asset = performance::Asset {
+            name: String::new(),
+            sha256: String::new(),
+            bytes: 0,
+        };
+        for version in ["0.1.1", "71.23.109"] {
+            app.performance_release = Some(Box::new(performance::Release {
+                version: version.into(),
+                manifest: asset.clone(),
+                archive: asset.clone(),
+                checksums: asset.clone(),
+            }));
+            let (_, url, label) = app.tab_source(PackageTab::Performance);
+            assert_eq!(label, format!("Release · v{version}"));
+            assert!(url.ends_with(&format!("/releases/tag/v{version}")));
+        }
     }
 
     #[test]
@@ -2404,7 +2460,7 @@ mod tests {
             .unwrap();
         app.receive();
         assert_eq!(app.tab_source(app.tab).0, performance::REPOSITORY);
-        assert_eq!(app.tab_source(app.tab).2, "Pinned release · v0.1.0");
+        assert_eq!(app.tab_source(app.tab).2, "GitHub releases");
         assert_eq!(app.status, "Catalog refreshed");
         assert_eq!(app.releases.len(), 1);
         assert_eq!(app.ime_releases.len(), 1);
@@ -2855,6 +2911,7 @@ mod tests {
                 translation: Some(Err("C:/Games/Ready/bundle.json".into())),
                 ime: Some(Err("native ABI mismatch".into())),
                 performance: None,
+                performance_release: None,
             }))))
             .unwrap();
         app.receiver = Some(receiver);
@@ -3288,6 +3345,7 @@ mod tests {
                     ime: (failed_tab == PackageTab::Ime).then(|| Err("Retired IME cache".into())),
                     performance: (failed_tab == PackageTab::Performance)
                         .then(|| Err("Retired performance cache".into())),
+                    performance_release: None,
                 }))))
                 .unwrap();
             app.receiver = Some(receiver);
@@ -3317,6 +3375,7 @@ mod tests {
                 translation: None,
                 ime: Some(Err("Retired IME cache".into())),
                 performance: None,
+                performance_release: None,
             }))))
             .unwrap();
         app.receiver = Some(receiver);
