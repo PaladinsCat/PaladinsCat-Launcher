@@ -10,8 +10,63 @@ use std::{
 
 pub type Result<T> = std::result::Result<T, String>;
 pub type Progress<'a> = &'a dyn Fn(String);
+
+/// Product labels contain only the numeric package revision. Descriptive legacy
+/// IDs and content hashes remain intact for cache/receipt ownership and diagnostics.
+pub fn package_version_label(bundle_id: &str) -> String {
+    for part in bundle_id.split('-') {
+        if let Some(digits) = part.strip_prefix('v')
+            && !digits.is_empty()
+            && digits.bytes().all(|c| c.is_ascii_digit())
+        {
+            return format!("v{digits}");
+        }
+    }
+    String::new()
+}
+
+pub fn package_caption(bundle_id: &str, locale: &str, build: &str) -> String {
+    let version = package_version_label(bundle_id);
+    format!(
+        "{} · {build}",
+        if version.is_empty() { locale } else { &version }
+    )
+}
+
+pub fn installed_package_caption(status: &str) -> String {
+    if let Some((locale, identity)) = status.split_once(" · ") {
+        let version = package_version_label(identity);
+        if !version.is_empty() {
+            return format!("{locale} · {version}");
+        }
+    }
+    status.to_owned()
+}
 pub fn save_settings<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     upk_patcher::save_json_atomic(path, value)
+}
+
+#[cfg(test)]
+mod version_label_tests {
+    use super::*;
+    #[test]
+    fn product_versions_hide_descriptions_and_hashes_without_changing_identity() {
+        for identity in [
+            "kor-ui-v177-gold-1a73a309d6ab",
+            "kor-ui-v177-1a73a309d6ab",
+            "kor-ui-v177-approved",
+            "kor-ui-v177",
+        ] {
+            assert_eq!(package_caption(identity, "KOR", "8.1"), "v177 · 8.1");
+        }
+        assert_eq!(package_caption("legacy-package", "KOR", "8.1"), "KOR · 8.1");
+        assert_eq!(package_version_label("kor-ui-version177-gold"), "");
+        assert_eq!(
+            installed_package_caption("KOR · kor-ui-v177-gold-1a73a309d6ab"),
+            "KOR · v177"
+        );
+        assert_eq!(installed_package_caption("Not installed"), "Not installed");
+    }
 }
 const LIMIT: u64 = 2 * 1024 * 1024 * 1024;
 const STATE: &str = ".watchcat-localization";

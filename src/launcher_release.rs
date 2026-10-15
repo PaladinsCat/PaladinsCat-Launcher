@@ -105,6 +105,7 @@ fn source_path(path: &str) -> bool {
             | "examples/verify_icon.rs"
             | "examples/native_loader_fixture.rs"
             | "docs/architecture.md"
+            | "docs/package-versions.md"
             | "docs/replay-profiles.md"
             | "docs/download-cache.md"
             | "docs/verification-0.3.6.md"

@@ -1016,9 +1016,12 @@ impl App {
                         });
                     });
                     ui.label(
-                        RichText::new(language.text(&format!("Installed: {}", self.installed)))
-                            .size(12.)
-                            .color(MUTED),
+                        RichText::new(language.text(&format!(
+                            "Installed: {}",
+                            engine::installed_package_caption(&self.installed)
+                        )))
+                        .size(12.)
+                        .color(MUTED),
                     );
                 });
                 ui.add_space(12.);
@@ -1183,12 +1186,22 @@ impl App {
                                     self.releases
                                         .get(self.release_index)
                                         .filter(|r| r.locale == self.language)
-                                        .map(|r| format!("{} · {}", r.bundle_id, r.game_build))
+                                        .map(|r| {
+                                            engine::package_caption(
+                                                &r.bundle_id,
+                                                &r.locale,
+                                                &r.game_build,
+                                            )
+                                        })
                                         .or_else(|| {
                                             self.selected.as_ref().map(|p| {
                                                 language.text(&format!(
                                                     "Local · {}",
-                                                    p.package.bundle_id
+                                                    engine::package_caption(
+                                                        &p.package.bundle_id,
+                                                        &p.package.locale,
+                                                        &p.package.game_build
+                                                    )
                                                 ))
                                             })
                                         })
@@ -1206,9 +1219,10 @@ impl App {
                                         ui.selectable_value(
                                             &mut self.release_index,
                                             i,
-                                            format!(
-                                                "{} · {}",
-                                                release.bundle_id, release.game_build
+                                            engine::package_caption(
+                                                &release.bundle_id,
+                                                &release.locale,
+                                                &release.game_build,
                                             ),
                                         );
                                     }
@@ -1237,7 +1251,11 @@ impl App {
                                     ui.label(
                                         RichText::new(language.text(&format!(
                                             "Prepared: {}",
-                                            selected.package.bundle_id
+                                            engine::package_caption(
+                                                &selected.package.bundle_id,
+                                                &selected.package.locale,
+                                                &selected.package.game_build
+                                            )
                                         )))
                                         .color(ACCENT)
                                         .size(12.),
