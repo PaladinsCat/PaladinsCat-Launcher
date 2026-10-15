@@ -403,6 +403,9 @@ fn plan_with(
     if let Some(flag) = options.platform.flag() {
         args.insert(0, flag.into());
     }
+    if let Some(package) = &options.performance {
+        performance::apply_worker_policy(&package.package, &mut args)?;
+    }
     Ok(Plan {
         args,
         game_root: root,

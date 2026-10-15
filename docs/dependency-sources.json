@@ -1,5 +1,5 @@
 {
-  "cargo_lock_sha256": "29c05e037d74b4bbe90e4610c9f067136dbc38ea212249359ecfe65c12494750",
+  "cargo_lock_sha256": "edd90f46bbe76f93de25f877f0bb86c18383a84997eb9670be9f451d6bd35c04",
   "dependencies": [
     {
       "name": "accesskit",
@@ -2546,5 +2546,5 @@
       "version": "4.2.0"
     }
   ],
-  "launcher_version": "0.3.9"
+  "launcher_version": "0.3.10"
 }

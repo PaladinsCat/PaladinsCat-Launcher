@@ -64,7 +64,76 @@ pub struct Package {
     pub performance_verified: bool,
     pub compatibility_verified: bool,
     pub rendering: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_policy: Option<WorkerPolicy>,
     pub assets: Vec<Asset>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerPolicy {
+    ActiveLogicalProcessors,
+}
+
+fn active_logical_processors() -> Result<u32> {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetActiveProcessorCount(group: u16) -> u32;
+            fn GetActiveProcessorGroupCount() -> u16;
+        }
+        if unsafe { GetActiveProcessorGroupCount() } != 1 {
+            return Err("Native worker policy requires one processor group".into());
+        }
+        let count = unsafe { GetActiveProcessorCount(u16::MAX) };
+        if count == 0 || count > i32::MAX as u32 {
+            return Err("Active logical processor count is unavailable".into());
+        }
+        Ok(count)
+    }
+    #[cfg(not(windows))]
+    Err("Native worker policy requires Windows".into())
+}
+
+fn worker_policy_with(
+    policy: Option<WorkerPolicy>,
+    args: &mut Vec<String>,
+    count: impl FnOnce() -> Result<u32>,
+) -> Result<()> {
+    let Some(WorkerPolicy::ActiveLogicalProcessors) = policy else {
+        return Ok(());
+    };
+    let existing: Vec<_> = args
+        .iter()
+        .enumerate()
+        .filter_map(|(index, arg)| {
+            arg.trim_start_matches('-')
+                .split_once('=')
+                .filter(|(name, _)| name.eq_ignore_ascii_case("THREADPOOL"))
+                .map(|_| index)
+        })
+        .collect();
+    if existing.len() > 1 {
+        return Err("Duplicate native THREADPOOL arguments".into());
+    }
+    let count = count()?;
+    if count == 0 || count > i32::MAX as u32 {
+        return Err("Invalid native worker count".into());
+    }
+    let argument = format!("THREADPOOL={count}");
+    if let Some(index) = existing.first() {
+        args[*index] = argument;
+    } else {
+        args.push(argument);
+    }
+    Ok(())
+}
+
+/// Resolve verified package policy before process creation, so native startup
+/// sizes the worker pool and its renderer resources from the same count.
+pub fn apply_worker_policy(package: &Package, args: &mut Vec<String>) -> Result<()> {
+    worker_policy_with(package.worker_policy, args, active_logical_processors)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -762,6 +831,77 @@ pub fn import(manifest: &Path, cache: &Path) -> Result<Cached> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn package_policy_sets_startup_workers_without_release_or_hardware_pins() {
+        let legacy = vec!["-Language=KOR".to_owned()];
+        let mut arguments = legacy.clone();
+        worker_policy_with(None, &mut arguments, || {
+            panic!("legacy policy queried topology")
+        })
+        .unwrap();
+        assert_eq!(arguments, legacy);
+        for count in [1, 13, 57] {
+            let mut arguments = legacy.clone();
+            worker_policy_with(
+                Some(WorkerPolicy::ActiveLogicalProcessors),
+                &mut arguments,
+                || Ok(count),
+            )
+            .unwrap();
+            assert_eq!(arguments.last().unwrap(), &format!("THREADPOOL={count}"));
+        }
+        let mut arguments = vec!["-ThreadPool=8".into()];
+        worker_policy_with(
+            Some(WorkerPolicy::ActiveLogicalProcessors),
+            &mut arguments,
+            || Ok(23),
+        )
+        .unwrap();
+        assert_eq!(arguments, ["THREADPOOL=23"]);
+        for mut arguments in [
+            vec!["THREADPOOL=8".into(), "-threadpool=4".into()],
+            legacy.clone(),
+        ] {
+            let original = arguments.clone();
+            assert!(
+                worker_policy_with(
+                    Some(WorkerPolicy::ActiveLogicalProcessors),
+                    &mut arguments,
+                    || Err("topology unavailable".into())
+                )
+                .is_err()
+            );
+            assert_eq!(arguments, original);
+        }
+        for count in [0, u32::MAX] {
+            assert!(
+                worker_policy_with(
+                    Some(WorkerPolicy::ActiveLogicalProcessors),
+                    &mut legacy.clone(),
+                    || Ok(count)
+                )
+                .is_err()
+            );
+        }
+        let (_, manifest, _) = fixture();
+        let mut manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+        assert!(
+            serde_json::from_value::<Package>(manifest.clone())
+                .unwrap()
+                .worker_policy
+                .is_none()
+        );
+        manifest["version"] = "71.23.109".into();
+        manifest["worker_policy"] = "active_logical_processors".into();
+        let package: Package = serde_json::from_value(manifest.clone()).unwrap();
+        validate_contents(&package).unwrap();
+        assert_eq!(
+            package.worker_policy,
+            Some(WorkerPolicy::ActiveLogicalProcessors)
+        );
+        manifest["worker_policy"] = "unknown".into();
+        assert!(serde_json::from_value::<Package>(manifest).is_err());
+    }
     use std::io::Cursor;
     use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
@@ -892,6 +1032,7 @@ mod tests {
             performance_verified: false,
             compatibility_verified: false,
             rendering: "uncapped; 1000 FPS target is not a limiter".into(),
+            worker_policy: None,
             assets,
         };
         let manifest = serde_json::to_vec(&package).unwrap();

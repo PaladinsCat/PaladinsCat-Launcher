@@ -3076,6 +3076,7 @@ mod tests {
                         performance_verified: false,
                         compatibility_verified: false,
                         rendering: "fixture".into(),
+                        worker_policy: None,
                         assets: Vec::new(),
                     },
                     directory: PathBuf::from("cache/performance"),
